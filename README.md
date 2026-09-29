@@ -55,6 +55,8 @@ pi 做完一个小项就会停下来问"要不要继续"。跑长计划（例如
 作为 pi 包装（推荐）：
 
 ```bash
+pi install npm:@ggbondex/pi-goal
+# 或直接装 GitHub 上的源码：
 pi install git:github.com:ggbondex/pi-goal
 ```
 

@@ -1,5 +1,5 @@
 {
-  "name": "pi-goal",
+  "name": "@ggbondex/pi-goal",
   "version": "0.1.0",
   "description": "Autonomous goal loop for pi: an AI judge decides whether the goal is done, otherwise the original goal is re-sent to the agent.",
   "type": "module",
@@ -11,6 +11,11 @@
     "agent-loop"
   ],
   "license": "MIT",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ggbondex/pi-goal.git"
