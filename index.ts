@@ -16,12 +16,14 @@
  * stops. A hard iteration cap prevents runaway loops.
  *
  * Commands:
- *   /goal <objective>      start a goal (or repeat the objective verbatim)
+ *   /goal <objective>      start a goal (or replace the current one)
  *   /goal                  show status
- *   /goal off              stop the loop (keeps the objective for /goal resume)
- *   /goal resume           re-activate and keep going
+ *   /goal stop             stop the loop (keeps the objective for /goal resume)
+ *   /goal resume           re-activate from the last verdict and keep going
+ *   /goal clear            delete the goal entirely
  *   /goal model <spec>     judge model: "auto" | "provider/modelId" | modelId
  *   /goal max <n>          hard cap on automatic continuations (default 15)
+ *   /goal help             usage
  *
  * Environment defaults:
  *   PI_GOAL_MAX            default max continuations
@@ -54,6 +56,24 @@ const MAX_JUDGE_ERRORS = 3;
 const TRANSCRIPT_TAIL_CHARS = 40_000;
 
 type NotifyKind = "info" | "warning" | "error";
+
+const STOP_LABELS: Record<string, string> = {
+	done: "已完成",
+	blocked: "受阻待答复",
+	"max-iterations": "已达续跑上限",
+	manual: "已停止",
+	"judge-error": "判定失败",
+};
+
+const HELP_TEXT = [
+	"/goal <目标>         启动目标循环（会覆盖当前目标）",
+	"/goal                查看状态",
+	"/goal stop           停止循环（保留目标，可 resume）",
+	"/goal resume         从断点接着跑",
+	"/goal clear          彻底清除目标",
+	"/goal model <spec>   判定模型：auto | provider/modelId | modelId",
+	"/goal max <n>        自动续跑上限（默认 15）",
+].join("\n");
 
 interface Verdict {
 	done: boolean;
@@ -211,7 +231,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		if (state?.active) {
 			notify(
 				ctx,
-				`🎯 有一个未完成的目标（${state.iterations}/${state.maxIterations}）。用 /goal resume 继续，/goal off 停止。`,
+				`🎯 有一个未完成的目标（${state.iterations}/${state.maxIterations}）。用 /goal resume 继续，/goal stop 停止。`,
 				"info",
 			);
 		}
@@ -437,7 +457,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		if (verdict.blocked) {
 			state = { ...s, active: false, stopReason: "blocked", waitingForUser: true, lastVerdict: verdict, updatedAt: Date.now() };
 			updateStatus(ctx);
-			notify(ctx, `🎯 目标受阻，需要你决定后才能继续：${verdict.reason}\n回答后循环会自动恢复；想彻底停下用 /goal off。`, "warning");
+			notify(ctx, `🎯 目标受阻，需要你决定后才能继续：${verdict.reason}\n回答后循环会自动恢复；想彻底停下用 /goal stop。`, "warning");
 			entries.push(stateDraft(state));
 			return { entries };
 		}
@@ -477,7 +497,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		updateStatus(ctx);
 		notify(
 			ctx,
-			`🎯 目标已启动（判定模型：${state.judgeModel || "当前会话模型"}；上限 ${state.maxIterations} 次）。/goal off 停止。`,
+			`🎯 目标已启动（判定模型：${state.judgeModel || "当前会话模型"}；上限 ${state.maxIterations} 次）。/goal stop 停止。`,
 			"info",
 		);
 
@@ -496,7 +516,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		}
 		const lines = [
 			`目标：${s.objective}`,
-			`状态：${s.active ? "进行中" : `已停止（${s.stopReason ?? "unknown"}）`}`,
+			`状态：${s.active ? "进行中" : `已停止（${s.stopReason ? (STOP_LABELS[s.stopReason] ?? s.stopReason) : "unknown"}）`}`,
 			`续跑：${s.iterations}/${s.maxIterations}`,
 			`判定模型：${s.judgeModel || "跟随当前会话模型"}`,
 		];
@@ -511,7 +531,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 	pi.registerCommand("goal", {
 		description: "自主目标循环：每轮结束由 AI 判定目标是否完成，未完成则自动续跑",
 		getArgumentCompletions: (prefix) => {
-			const options = ["off", "clear", "status", "resume", "model ", "max "];
+			const options = ["stop", "resume", "clear", "status", "help", "model ", "max "];
 			const matches = options.filter((o) => o.startsWith(prefix));
 			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
 		},
@@ -525,7 +545,12 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			const [verb, ...rest] = input.split(/\s+/);
 			const restText = rest.join(" ").trim();
 
-			if (verb === "off" || verb === "stop" || verb === "cancel") {
+			if (verb === "help" || verb === "-h" || verb === "--help") {
+				notify(ctx, HELP_TEXT, "info");
+				return;
+			}
+
+			if (verb === "stop") {
 				if (!state) {
 					notify(ctx, "当前没有进行中的目标。", "info");
 					return;
@@ -535,7 +560,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 				return;
 			}
 
-			if (verb === "clear" || verb === "cancel" || verb === "reset" || verb === "delete" || verb === "remove") {
+			if (verb === "clear" || verb === "cancel") {
 				if (!state) {
 					notify(ctx, "当前没有目标可清除。", "info");
 					return;
@@ -621,7 +646,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			const objective = s.objective && s.objective.length > 80 ? `${s.objective.slice(0, 80)}…` : s.objective;
 			return new Text(theme.fg("dim", `🎯 goal cleared${objective ? `: ${objective}` : ""}`), 0, 0);
 		}
-		const status = s.active ? theme.fg("accent", "active") : theme.fg("dim", s.stopReason ?? "stopped");
+		const status = s.active ? theme.fg("accent", "active") : theme.fg("dim", s.stopReason ? (STOP_LABELS[s.stopReason] ?? s.stopReason) : "stopped");
 		const head = theme.fg("muted", `🎯 goal ${s.iterations}/${s.maxIterations} `) + status;
 		const objective = s.objective.length > 100 ? `${s.objective.slice(0, 100)}…` : s.objective;
 		return new Text(`${head}\n${theme.fg("dim", objective)}`, 0, 0);

@@ -179,7 +179,7 @@ check("stops after 3 judge errors", entries.at(-1)?.data?.stopReason === "judge-
 // --- scenario 9: off ------------------------------------------------------
 console.log("\n[9] off");
 await goal.handler("要停的目标", makeCtx());
-await goal.handler("off", makeCtx());
+await goal.handler("stop", makeCtx());
 check("deactivated", entries.at(-1)?.data?.active === false && entries.at(-1)?.data?.stopReason === "manual");
 result = await settleAndCommit(makeEvent(), makeCtx());
 check("inactive goal never continues", !result || !result.entries?.length);
@@ -205,7 +205,7 @@ check("last status shows 50", String(tuiCtx.statuses.at(-1) ?? "").includes("50"
 
 // --- scenario 12: blocked pauses; answering resumes automatically --------
 console.log("\n[12] blocked pauses, answering resumes");
-await goal.handler("off", makeCtx());
+await goal.handler("stop", makeCtx());
 await goal.handler("受阻目标", makeCtx());
 judgeReply = { done: false, blocked: true, reason: "需要用户在方案 A/B 之间选", next: "" };
 await settleAndCommit(makeEvent(), makeCtx());
@@ -227,7 +227,7 @@ check("no resume while already active", (await beforeAgentStart({ type: "before_
 // --- scenario 13: clear deletes the goal, even across a reload ------------
 console.log("\n[13] clear removes the goal");
 const uiCtx = () => makeCtx({ hasUI: true, mode: "tui" });
-await goal.handler("off", uiCtx());
+await goal.handler("stop", uiCtx());
 await goal.handler("会被中止的目标", uiCtx());
 await settleAndCommit(makeEvent({ outcome: "aborted" }), uiCtx());
 check(
@@ -252,6 +252,15 @@ await handlers.session_start[0]({ type: "session_start" }, makeCtx({ sessionMana
 notifications.length = 0;
 await goal.handler("status", uiCtx());
 check("stays cleared after a reload", notifications.at(-1) === "当前没有目标。用法：/goal <目标>", notifications.at(-1));
+
+// --- scenario 14: help does not create a goal ----------------------------
+console.log("\n[14] help");
+notifications.length = 0;
+await goal.handler("help", uiCtx());
+check("help lists the commands", String(notifications.at(-1) ?? "").includes("/goal stop"), notifications.at(-1));
+notifications.length = 0;
+await goal.handler("status", uiCtx());
+check("help created no goal", notifications.at(-1) === "当前没有目标。用法：/goal <目标>", notifications.at(-1));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

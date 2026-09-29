@@ -17,11 +17,12 @@ pi 做完一个小项就会停下来问"要不要继续"。跑长计划（例如
 
 ```
 /goal                 查看状态（目标、续跑次数、上次判定、下一步）
-/goal off             停止循环（保留目标，可 resume）
+/goal stop            停止循环（保留目标，可 resume）
+/goal resume          从断点接着跑
 /goal clear           彻底清除目标（不再记忆，含重启/切分支后）
-/goal resume          恢复循环并接着跑
 /goal model <spec>    指定判定模型：auto | provider/modelId | modelId
 /goal max <n>         续跑上限（默认 15）
+/goal help            用法
 ```
 
 一次性默认值可用环境变量：`PI_GOAL_MAX`、`PI_GOAL_MODEL`。
@@ -32,7 +33,7 @@ pi 做完一个小项就会停下来问"要不要继续"。跑长计划（例如
 2. 当这轮 agent 真正要收尾时（`agent_before_settle`），扩展把目标 + 当前对话记录交给判定模型，要求它只返回一个 JSON：
    `{"done": bool, "blocked": bool, "reason": "...", "next": "..."}`。
 3. 判定为 `done` → 停止，并提示"目标已完成"。
-   `blocked` → **暂停**（不是结束）：把"需要你决定什么"告诉你；你直接回答即可，下一轮会自动恢复并接着跑。想彻底停下用 `/goal off`。
+   `blocked` → **暂停**（不是结束）：把"需要你决定什么"告诉你；你直接回答即可，下一轮会自动恢复并接着跑。想彻底停下用 `/goal stop`。
    都不是 → 注入一条续跑消息（含判定原因、下一步、以及**原始目标原文**），agent 继续。
 4. 硬上限保护：最多自动续跑 `max` 次；判定连续失败 3 次也停；你在判定或干活时按 Esc 会直接停止循环。
 
