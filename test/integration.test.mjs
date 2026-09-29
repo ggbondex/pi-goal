@@ -36,6 +36,7 @@ const fakeModelDef = {
 
 let mainTurns = 0;
 let judgeCalls = 0;
+let blockNext = false;
 
 function textOf(content) {
 	if (typeof content === "string") return content;
@@ -48,6 +49,10 @@ function decide(messages) {
 	const text = textOf(lastUser?.content);
 	if (text.includes("completion judge")) {
 		judgeCalls += 1;
+		if (blockNext) {
+			blockNext = false;
+			return JSON.stringify({ done: false, blocked: true, reason: "需要用户在方案 A/B 之间选", next: "" });
+		}
 		return JSON.stringify({ done: false, blocked: false, reason: `judge call ${judgeCalls}`, next: "继续做" });
 	}
 	mainTurns += 1;
@@ -130,31 +135,56 @@ const { session } = await createAgentSession({
 });
 
 let ok = true;
+const check = (name, condition, extra) => {
+	console.log(`${condition ? "  ✓" : "  ✗"} ${name}`, condition ? "" : (extra ?? ""));
+	if (!condition) ok = false;
+};
+async function waitFor(label, predicate, timeoutMs = 15000) {
+	const until = Date.now() + timeoutMs;
+	while (Date.now() < until && !predicate()) await new Promise((resolve) => setTimeout(resolve, 50));
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	if (!predicate()) console.log(`  … timed out waiting for ${label}`);
+}
+
 try {
 	session.subscribe((event) => {
 		if (["agent_start", "agent_end", "agent_settled"].includes(event.type)) console.log("[event]", event.type);
 	});
+
+	// --- phase 1: "not done" keeps the loop going until the cap -----------
 	await session.prompt("/goal 完成测试目标：让循环至少自动续跑两次");
-	const deadline = Date.now() + 15000;
-	while (Date.now() < deadline && !(judgeCalls >= MAX && session.isIdle)) {
-		await new Promise((resolve) => setTimeout(resolve, 50));
-	}
-	await new Promise((resolve) => setTimeout(resolve, 100));
+	await waitFor("phase 1 cap", () => judgeCalls >= MAX && session.isIdle);
 
 	const assistantTexts = session.messages.filter((m) => m.role === "assistant").map((m) => textOf(m.content));
-	console.log("\n--- result ---");
+	console.log("\n--- phase 1 ---");
 	console.log("mainTurns:", mainTurns, "judgeCalls:", judgeCalls);
 	console.log("assistant texts:", assistantTexts);
-
-	const check = (name, condition, extra) => {
-		console.log(`${condition ? "  ✓" : "  ✗"} ${name}`, condition ? "" : (extra ?? ""));
-		if (!condition) ok = false;
-	};
 	check("no extension load errors", errors.length === 0, JSON.stringify(errors));
 	check(`main ran ${MAX + 1} turns`, mainTurns === MAX + 1, mainTurns);
 	check(`judge called ${MAX} times`, judgeCalls === MAX, judgeCalls);
 	check("first turn saw no continuation", assistantTexts[0]?.includes("sawContinuation=false"), assistantTexts[0]);
 	check("later turns saw the continuation", assistantTexts.slice(1).every((t) => t.includes("sawContinuation=true")), assistantTexts);
+
+	// --- phase 2: blocked pauses; the user's answer resumes it -----------
+	const isResumeNotice = (m) =>
+		m.role === "custom" && m.customType === "goal-loop-continuation" && textOf(m.content).includes("[goal-loop 恢复]");
+
+	const turnsBefore = mainTurns;
+	const judgesBefore = judgeCalls;
+	blockNext = true;
+	await session.prompt("/goal 第二个目标：受阻后要能自动恢复");
+	await waitFor("blocked pause", () => judgeCalls === judgesBefore + 1 && session.isIdle);
+	console.log("\n--- phase 2: blocked ---");
+	console.log("mainTurns:", mainTurns, "judgeCalls:", judgeCalls, "idle:", session.isIdle);
+	check("goal is paused after blocked", mainTurns === turnsBefore + 1 && judgeCalls === judgesBefore + 1, { mainTurns, judgeCalls });
+	check("no resume notice while paused", !session.messages.some(isResumeNotice));
+
+	await session.prompt("选方案 A");
+	await waitFor("auto resume", () => session.messages.some(isResumeNotice) && mainTurns >= turnsBefore + 2);
+	console.log("--- phase 2: after answer ---");
+	console.log("mainTurns:", mainTurns, "judgeCalls:", judgeCalls);
+	check("answering auto-resumes the goal", session.messages.some(isResumeNotice));
+	check("the loop kept going after the answer", mainTurns >= turnsBefore + 2, mainTurns);
 } finally {
 	session.dispose();
 	rmSync(sandbox, { recursive: true, force: true });

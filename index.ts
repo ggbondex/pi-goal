@@ -70,6 +70,8 @@ interface GoalState {
 	/** "" means "use the session's active model". */
 	judgeModel: string;
 	stopReason?: "done" | "blocked" | "max-iterations" | "manual" | "judge-error";
+	/** True when the loop paused because it needs an answer from the user. */
+	waitingForUser?: boolean;
 	lastVerdict?: Verdict;
 	createdAt: number;
 	updatedAt: number;
@@ -311,7 +313,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 
 	function stopWith(reason: GoalState["stopReason"], objectiveReason: string, ctx: ExtensionContext, kind: NotifyKind): void {
 		if (!state) return;
-		state = { ...state, active: false, stopReason: reason, updatedAt: Date.now() };
+		state = { ...state, active: false, stopReason: reason, waitingForUser: false, updatedAt: Date.now() };
 		updateStatus(ctx);
 		notify(ctx, objectiveReason, kind);
 	}
@@ -322,6 +324,33 @@ export default function goalLoop(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => reconstruct(ctx));
 	pi.on("session_tree", async (_event, ctx) => reconstruct(ctx));
+
+	// A blocked run is a pause, not an end: the moment the user answers the
+	// question that blocked it, un-pause and keep working on the same objective.
+	pi.on("before_agent_start", async (_event, ctx): Promise<BeforeAgentStartEventResult | undefined> => {
+		const s = state;
+		if (!s || s.active || !s.waitingForUser) return;
+
+		state = { ...s, active: true, waitingForUser: false, stopReason: undefined, updatedAt: Date.now() };
+		judgeErrors = 0;
+		persist();
+		updateStatus(ctx);
+		notify(ctx, `🎯 收到你的答复，目标循环已自动恢复（${state.iterations}/${state.maxIterations}）。`, "info");
+
+		return {
+			message: {
+				customType: MESSAGE_TYPE,
+				content: [
+					"[goal-loop 恢复]",
+					"你之前因为需要用户决定而暂停，用户已经在上面的消息里给出答复。",
+					"请基于该答复继续推进目标，不要再次询问是否继续，完成每步后自行验证。",
+					"",
+					`原始目标：${state.objective}`,
+				].join("\n"),
+				display: true,
+			},
+		};
+	});
 
 	// The whole loop lives here: this is the last boundary before pi settles.
 	pi.on("agent_before_settle", async (event, ctx): Promise<AgentBeforeSettleEventResult | undefined> => {
@@ -394,7 +423,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		}
 
 		if (verdict.done) {
-			state = { ...s, active: false, stopReason: "done", lastVerdict: verdict, updatedAt: Date.now() };
+			state = { ...s, active: false, stopReason: "done", waitingForUser: false, lastVerdict: verdict, updatedAt: Date.now() };
 			updateStatus(ctx);
 			notify(ctx, `🎯 目标已完成：${verdict.reason}`, "info");
 			entries.push(stateDraft(state));
@@ -402,9 +431,9 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		}
 
 		if (verdict.blocked) {
-			state = { ...s, active: false, stopReason: "blocked", lastVerdict: verdict, updatedAt: Date.now() };
+			state = { ...s, active: false, stopReason: "blocked", waitingForUser: true, lastVerdict: verdict, updatedAt: Date.now() };
 			updateStatus(ctx);
-			notify(ctx, `🎯 目标受阻，需要你决定后才能继续：${verdict.reason}`, "warning");
+			notify(ctx, `🎯 目标受阻，需要你决定后才能继续：${verdict.reason}\n回答后循环会自动恢复；想彻底停下用 /goal off。`, "warning");
 			entries.push(stateDraft(state));
 			return { entries };
 		}
@@ -507,7 +536,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 					notify(ctx, "没有可恢复的目标。用 /goal <目标> 新建一个。", "warning");
 					return;
 				}
-				state = { ...state, active: true, iterations: 0, stopReason: undefined, updatedAt: Date.now() };
+				state = { ...state, active: true, iterations: 0, stopReason: undefined, waitingForUser: false, updatedAt: Date.now() };
 				judgeErrors = 0;
 				persist();
 				updateStatus(ctx);

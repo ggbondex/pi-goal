@@ -203,5 +203,26 @@ const tuiCtx = makeCtx({ mode: "tui" });
 await goal.handler("max 50", tuiCtx);
 check("last status shows 50", String(tuiCtx.statuses.at(-1) ?? "").includes("50"), tuiCtx.statuses.at(-1));
 
+// --- scenario 12: blocked pauses; answering resumes automatically --------
+console.log("\n[12] blocked pauses, answering resumes");
+await goal.handler("off", makeCtx());
+await goal.handler("受阻目标", makeCtx());
+judgeReply = { done: false, blocked: true, reason: "需要用户在方案 A/B 之间选", next: "" };
+await settleAndCommit(makeEvent(), makeCtx());
+check(
+	"paused waiting for the user",
+	entries.at(-1)?.data?.active === false && entries.at(-1)?.data?.waitingForUser === true,
+	entries.at(-1)?.data,
+);
+const beforeAgentStart = handlers.before_agent_start[0];
+const resumed = await beforeAgentStart({ type: "before_agent_start", prompt: "选 A" }, makeCtx());
+check("resumes on the user's answer", entries.at(-1)?.data?.active === true, entries.at(-1)?.data);
+check("injects a resume reminder", String(resumed?.message?.content ?? "").includes("原始目标"));
+check("reminder restates the objective", String(resumed?.message?.content ?? "").includes("受阻目标"));
+judgeReply = { done: false, blocked: false, reason: "继续做 A", next: "做 A" };
+const afterResume = await settleAndCommit(makeEvent(), makeCtx());
+check("continues after resuming", afterResume?.continue === true);
+check("no resume while already active", (await beforeAgentStart({ type: "before_agent_start", prompt: "x" }, makeCtx())) === undefined);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
