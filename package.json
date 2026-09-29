@@ -1,0 +1,33 @@
+{
+  "name": "pi-goal",
+  "version": "0.1.0",
+  "description": "Autonomous goal loop for pi: an AI judge decides whether the goal is done, otherwise the original goal is re-sent to the agent.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "goal",
+    "agent-loop"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ggbondex/pi-goal.git"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "scripts": {
+    "setup": "node test/setup.mjs",
+    "test": "node test/setup.mjs && node test/mock.test.mjs && node test/integration.test.mjs"
+  }
+}
