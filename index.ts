@@ -72,6 +72,8 @@ interface GoalState {
 	stopReason?: "done" | "blocked" | "max-iterations" | "manual" | "judge-error";
 	/** True when the loop paused because it needs an answer from the user. */
 	waitingForUser?: boolean;
+	/** Set on the tombstone entry that deletes the goal from the branch. */
+	cleared?: boolean;
 	lastVerdict?: Verdict;
 	createdAt: number;
 	updatedAt: number;
@@ -197,7 +199,9 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		let last: GoalState | null = null;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === ENTRY_TYPE && entry.data) {
-				last = entry.data as GoalState;
+				const data = entry.data as GoalState;
+				// A cleared marker tombstones every goal before it on this branch.
+				last = data.cleared ? null : data;
 			}
 		}
 		state = last ? { ...last, judgeModel: last.judgeModel ?? "" } : null;
@@ -361,7 +365,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 
 		// User pressed Esc / aborted: stop the loop instead of fighting them.
 		if (event.outcome === "aborted") {
-			stopWith("manual", "🎯 目标循环已停止（本轮被中断）。用 /goal resume 可继续。", ctx, "warning");
+			stopWith("manual", "🎯 目标循环已停止（本轮被中断）。用 /goal resume 可继续，/goal clear 可清除。", ctx, "warning");
 			entries.push(stateDraft(state as GoalState));
 			return { entries };
 		}
@@ -399,7 +403,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			judging = false;
 			// Aborting while we judge (Esc) must stop the loop, not count as a judge failure.
 			if (ctx.signal?.aborted) {
-				stopWith("manual", "🎯 目标循环已停止（判定期间被中断）。用 /goal resume 可继续。", ctx, "warning");
+				stopWith("manual", "🎯 目标循环已停止（判定期间被中断）。用 /goal resume 可继续，/goal clear 可清除。", ctx, "warning");
 				entries.push(stateDraft(state as GoalState));
 				return { entries };
 			}
@@ -417,7 +421,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		judging = false;
 
 		if (ctx.signal?.aborted) {
-			stopWith("manual", "🎯 目标循环已停止（判定期间被中断）。用 /goal resume 可继续。", ctx, "warning");
+			stopWith("manual", "🎯 目标循环已停止（判定期间被中断）。用 /goal resume 可继续，/goal clear 可清除。", ctx, "warning");
 			entries.push(stateDraft(state as GoalState));
 			return { entries };
 		}
@@ -507,7 +511,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 	pi.registerCommand("goal", {
 		description: "自主目标循环：每轮结束由 AI 判定目标是否完成，未完成则自动续跑",
 		getArgumentCompletions: (prefix) => {
-			const options = ["off", "status", "resume", "model ", "max "];
+			const options = ["off", "clear", "status", "resume", "model ", "max "];
 			const matches = options.filter((o) => o.startsWith(prefix));
 			return matches.length ? matches.map((value) => ({ value, label: value })) : null;
 		},
@@ -526,8 +530,23 @@ export default function goalLoop(pi: ExtensionAPI): void {
 					notify(ctx, "当前没有进行中的目标。", "info");
 					return;
 				}
-				stopWith("manual", "🎯 目标循环已停止。用 /goal resume 可继续。", ctx, "warning");
+				stopWith("manual", "🎯 目标循环已停止。用 /goal resume 可继续，/goal clear 可清除。", ctx, "warning");
 				persist();
+				return;
+			}
+
+			if (verb === "clear" || verb === "cancel" || verb === "reset" || verb === "delete" || verb === "remove") {
+				if (!state) {
+					notify(ctx, "当前没有目标可清除。", "info");
+					return;
+				}
+				const objective = state.objective;
+				state = null;
+				judgeErrors = 0;
+				// A tombstone entry, so a reload or a branch switch stays cleared.
+				pi.appendEntry(ENTRY_TYPE, { cleared: true, objective, updatedAt: Date.now() });
+				updateStatus(ctx);
+				notify(ctx, `🎯 已清除目标（不再记忆）：${objective}`, "info");
 				return;
 			}
 
@@ -598,6 +617,10 @@ export default function goalLoop(pi: ExtensionAPI): void {
 	pi.registerEntryRenderer(ENTRY_TYPE, (entry: CustomEntry<GoalState>, _options, theme) => {
 		const s = entry.data;
 		if (!s) return undefined;
+		if (s.cleared) {
+			const objective = s.objective && s.objective.length > 80 ? `${s.objective.slice(0, 80)}…` : s.objective;
+			return new Text(theme.fg("dim", `🎯 goal cleared${objective ? `: ${objective}` : ""}`), 0, 0);
+		}
 		const status = s.active ? theme.fg("accent", "active") : theme.fg("dim", s.stopReason ?? "stopped");
 		const head = theme.fg("muted", `🎯 goal ${s.iterations}/${s.maxIterations} `) + status;
 		const objective = s.objective.length > 100 ? `${s.objective.slice(0, 100)}…` : s.objective;

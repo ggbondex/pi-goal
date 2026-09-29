@@ -17,7 +17,8 @@ pi 做完一个小项就会停下来问"要不要继续"。跑长计划（例如
 
 ```
 /goal                 查看状态（目标、续跑次数、上次判定、下一步）
-/goal off             停止循环（保留目标）
+/goal off             停止循环（保留目标，可 resume）
+/goal clear           彻底清除目标（不再记忆，含重启/切分支后）
 /goal resume          恢复循环并接着跑
 /goal model <spec>    指定判定模型：auto | provider/modelId | modelId
 /goal max <n>         续跑上限（默认 15）

@@ -224,5 +224,34 @@ const afterResume = await settleAndCommit(makeEvent(), makeCtx());
 check("continues after resuming", afterResume?.continue === true);
 check("no resume while already active", (await beforeAgentStart({ type: "before_agent_start", prompt: "x" }, makeCtx())) === undefined);
 
+// --- scenario 13: clear deletes the goal, even across a reload ------------
+console.log("\n[13] clear removes the goal");
+const uiCtx = () => makeCtx({ hasUI: true, mode: "tui" });
+await goal.handler("off", uiCtx());
+await goal.handler("会被中止的目标", uiCtx());
+await settleAndCommit(makeEvent({ outcome: "aborted" }), uiCtx());
+check(
+	"aborted goal is stopped but kept",
+	entries.at(-1)?.data?.active === false && entries.at(-1)?.data?.objective === "会被中止的目标",
+	entries.at(-1)?.data,
+);
+notifications.length = 0;
+await goal.handler("status", uiCtx());
+check("status still shows it before clear", notifications.some((n) => n.includes("会被中止的目标")), notifications);
+const clearCtx = uiCtx();
+await goal.handler("clear", clearCtx);
+check("persists a cleared marker", entries.at(-1)?.data?.cleared === true, entries.at(-1)?.data);
+check("clears the footer status", clearCtx.statuses.at(-1) === undefined, clearCtx.statuses.at(-1));
+notifications.length = 0;
+await goal.handler("status", uiCtx());
+check("status is empty after clear", notifications.at(-1) === "当前没有目标。用法：/goal <目标>", notifications.at(-1));
+const afterClear = await settleAndCommit(makeEvent(), uiCtx());
+check("cleared goal never continues", !afterClear || !afterClear.entries?.length);
+const branch = entries.map((entry) => ({ type: "custom", customType: entry.type, data: entry.data }));
+await handlers.session_start[0]({ type: "session_start" }, makeCtx({ sessionManager: { getBranch: () => branch } }));
+notifications.length = 0;
+await goal.handler("status", uiCtx());
+check("stays cleared after a reload", notifications.at(-1) === "当前没有目标。用法：/goal <目标>", notifications.at(-1));
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
