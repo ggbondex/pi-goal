@@ -37,6 +37,7 @@ console.log("registered commands:", Object.keys(commands));
 const fakeModel = { provider: "fake", id: "judge", name: "judge" };
 
 let judgeReply = { done: false, blocked: false, reason: "not yet", next: "do X" };
+let lastJudgePrompt = "";
 
 function makeCtx(overrides = {}) {
 	const statuses = [];
@@ -51,7 +52,10 @@ function makeCtx(overrides = {}) {
 			getAll: () => [fakeModel],
 			find: () => fakeModel,
 			hasConfiguredAuth: () => true,
-			complete: async () => ({ content: [{ type: "text", text: JSON.stringify(judgeReply) }] }),
+			complete: async (_model, options) => {
+				lastJudgePrompt = options?.messages?.[0]?.content?.[0]?.text ?? "";
+				return { content: [{ type: "text", text: JSON.stringify(judgeReply) }] };
+			},
 		},
 		model: fakeModel,
 		isIdle: () => true,
@@ -261,6 +265,15 @@ check("help lists the commands", String(notifications.at(-1) ?? "").includes("/g
 notifications.length = 0;
 await goal.handler("status", uiCtx());
 check("help created no goal", notifications.at(-1) === "当前没有目标。用法：/goal <目标>", notifications.at(-1));
+
+// --- scenario 15: the judge prompt guards the common false stalls -------
+console.log("\n[15] judge prompt guards");
+await goal.handler("判定提示词目标", makeCtx());
+judgeReply = { done: false, blocked: false, reason: "still going", next: "continue" };
+await settleAndCommit(makeEvent(), makeCtx());
+check("prompt says out-of-context is not a blocker", lastJudgePrompt.includes("ran out of context"));
+check("prompt says the harness compacts automatically", lastJudgePrompt.includes("compacts the transcript"));
+check("prompt says a continue-request is not completion", lastJudgePrompt.includes("shall I continue"));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
