@@ -1,6 +1,6 @@
 {
   "name": "@ggbondex/pi-goal",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Autonomous goal loop for pi: an AI judge decides whether the goal is done, otherwise the original goal is re-sent to the agent.",
   "type": "module",
   "keywords": [
