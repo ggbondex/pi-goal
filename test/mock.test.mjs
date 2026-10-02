@@ -4,6 +4,10 @@
  */
 import { createJiti } from "jiti";
 
+// Fast cooldowns / judge timeout so the error-resilience paths don't really sleep.
+process.env.PI_GOAL_RETRY_BASE_MS = "1";
+process.env.PI_GOAL_JUDGE_TIMEOUT_MS = "50";
+
 const jiti = createJiti(import.meta.url, { interopDefault: true });
 const mod = await jiti.import("../index.ts");
 const goalLoop = mod.default ?? mod;
@@ -44,6 +48,7 @@ function makeCtx(overrides = {}) {
 	const ctx = {
 		hasUI: false,
 		mode: "print",
+		cwd: process.cwd(),
 		ui: {
 			notify: (m) => notifications.push(m),
 			setStatus: (_key, value) => statuses.push(value),
@@ -77,6 +82,11 @@ function makeEvent(overrides = {}) {
 	};
 }
 
+/** A settle whose last assistant message is `text` — how a planning turn answers. */
+function assistantEvent(text) {
+	return makeEvent({ context: { contextMessages: [{ role: "assistant", content: [{ type: "text", text }] }] } });
+}
+
 const settle = handlers.agent_before_settle[0];
 async function settleAndCommit(event, ctx) {
 	const result = await settle(event, ctx);
@@ -87,6 +97,7 @@ async function settleAndCommit(event, ctx) {
 }
 
 const goal = commands.goal;
+const inputHandler = handlers.input[0];
 
 let pass = 0;
 let fail = 0;
@@ -174,11 +185,18 @@ const badCtx = makeCtx({
 	},
 });
 result = await settleAndCommit(makeEvent(), badCtx);
-check("does not continue on judge error", !result || result.continue !== true);
+check("first judge error cools down and continues", result?.continue === true, result);
+check(
+	"the retry continuation names the attempt",
+	(result?.entries ?? []).some((d) => d.type === "custom_message" && String(d.content ?? "").includes("[goal-loop 判定重试 1/3]")),
+	result?.entries,
+);
 check("still active after 1 error", entries.at(-1)?.data?.active === true, entries.at(-1)?.data);
-await settleAndCommit(makeEvent(), badCtx);
 result = await settleAndCommit(makeEvent(), badCtx);
-check("stops after 3 judge errors", entries.at(-1)?.data?.stopReason === "judge-error");
+check("second judge error still continues", result?.continue === true, result);
+result = await settleAndCommit(makeEvent(), badCtx);
+check("stops after 3 judge errors", entries.at(-1)?.data?.stopReason === "judge-error", entries.at(-1)?.data);
+check("judge-error stop is inactive", entries.at(-1)?.data?.active === false, entries.at(-1)?.data);
 
 // --- scenario 9: off ------------------------------------------------------
 console.log("\n[9] off");
@@ -272,8 +290,170 @@ await goal.handler("判定提示词目标", makeCtx());
 judgeReply = { done: false, blocked: false, reason: "still going", next: "continue" };
 await settleAndCommit(makeEvent(), makeCtx());
 check("prompt says out-of-context is not a blocker", lastJudgePrompt.includes("ran out of context"));
-check("prompt says the harness compacts automatically", lastJudgePrompt.includes("compacts the transcript"));
+check("prompt says the harness compacts automatically", lastJudgePrompt.includes("harness compacts"));
 check("prompt says a continue-request is not completion", lastJudgePrompt.includes("shall I continue"));
+
+// --- scenario 16: /goal plan starts a read-only research turn -------------
+console.log("\n[16] /goal plan -> research turn");
+await goal.handler("clear", makeCtx());
+userMessages.length = 0;
+notifications.length = 0;
+await goal.handler("plan 给助手加记笔记能力", uiCtx());
+check("planning turn started", String(userMessages.at(-1) ?? "").includes("planning stage"));
+check("phase is planning", entries.at(-1)?.data?.phase === "planning", entries.at(-1)?.data);
+check("source keeps the intent", entries.at(-1)?.data?.source?.intent?.includes("记笔记"));
+check(
+	"detail file is plugin-owned",
+	String(entries.at(-1)?.data?.detailFile ?? "").startsWith(".pi/goal-plans/"),
+	entries.at(-1)?.data?.detailFile,
+);
+check("planner told to write the detail file", String(userMessages.at(-1) ?? "").includes(entries.at(-1)?.data?.detailFile));
+
+// --- scenario 17: planning settle parses the plan -------------------------
+console.log("\n[17] planning settle -> draft");
+const planObj = {
+	objective: "给助手加记笔记能力",
+	exit: "真机记一条、重启后能检索到，远程 E2E 全绿",
+	milestones: [
+		{ title: "契约与表", exit: "迁移干跑通过", why: "先定合同" },
+		{ title: "后端读写", exit: "notes E2E 全绿", why: "写入面必须有 E2E" },
+		{ title: "iOS 入口", exit: "单测绿 + 模拟器手点", why: "最后做能看见的" },
+	],
+};
+notifications.length = 0;
+let planResult = await settleAndCommit(assistantEvent(JSON.stringify(planObj)), uiCtx());
+check("draft waits for confirmation", entries.at(-1)?.data?.phase === "awaiting-confirmation", entries.at(-1)?.data);
+check("draft carries three milestones", entries.at(-1)?.data?.plan?.milestones?.length === 3);
+check(
+	"board shows progress, the current milestone, and the detail pointer",
+	notifications.some((n) => n.includes("里程碑 0/3") && n.includes("▶ m1") && n.includes("详情 ")),
+);
+
+// --- scenario 18: a plain reply confirms; the plan drives -----------------
+console.log("\n[18] confirm -> transform -> drive");
+const transformed = await inputHandler({ type: "input", text: "同意", source: "interactive" }, makeCtx());
+check("confirm transforms into the kickoff", transformed?.action === "transform", transformed);
+check("kickoff names the objective", String(transformed?.text ?? "").includes("给助手加记笔记能力"));
+check("kickoff names the first milestone", String(transformed?.text ?? "").includes("m1") && String(transformed?.text ?? "").includes("契约与表"));
+check("goal is active after confirm", entries.at(-1)?.data?.active === true && entries.at(-1)?.data?.phase === undefined);
+judgeReply = { done: true, blocked: false, reason: "m1 完成", next: "" };
+planResult = await settleAndCommit(makeEvent(), makeCtx());
+check("current milestone marked done", entries.at(-1)?.data?.plan?.milestones?.[0]?.status === "done", entries.at(-1)?.data?.plan?.milestones);
+check("loop continues to the next milestone", planResult?.continue === true);
+check("continuation names the new current milestone", String(planResult?.entries?.find((e) => e.type === "custom_message")?.content ?? "").includes("m2"));
+
+// --- scenario 19: done is overruled while milestones remain ---------------
+console.log("\n[19] plan advances one milestone at a time");
+judgeReply = { done: true, blocked: false, reason: "m2 完成", next: "" };
+planResult = await settleAndCommit(makeEvent(), makeCtx());
+check(
+	"only the current milestone advances",
+	entries.at(-1)?.data?.plan?.milestones?.[1]?.status === "done" && entries.at(-1)?.data?.plan?.milestones?.[2]?.status !== "done",
+);
+check("still continues with m3 left", planResult?.continue === true, planResult);
+judgeReply = { done: true, blocked: false, reason: "m3 完成", next: "" };
+planResult = await settleAndCommit(makeEvent(), makeCtx());
+check("finishes once every milestone is done", !planResult || planResult.continue !== true);
+check("stop reason done", entries.at(-1)?.data?.stopReason === "done");
+check("all milestones done", entries.at(-1)?.data?.plan?.milestones?.every((m) => m.status === "done"));
+judgeReply = { done: false, blocked: false, reason: "not yet", next: "do X" };
+
+// --- scenario 20: the planner asks questions; the reply re-plans ----------
+console.log("\n[20] planner questions -> answers -> re-plan");
+await goal.handler("clear", makeCtx());
+notifications.length = 0;
+userMessages.length = 0;
+await goal.handler("plan 一个需要澄清的目标", uiCtx());
+await settleAndCommit(assistantEvent(JSON.stringify({ needs_answers: ["用哪个数据库？", "要不要兼容旧数据？"] })), uiCtx());
+check("phase awaiting answers", entries.at(-1)?.data?.phase === "awaiting-answers", entries.at(-1)?.data);
+check("questions stored", entries.at(-1)?.data?.questions?.length === 2);
+const answered = await inputHandler({ type: "input", text: "用 Postgres，不兼容旧数据", source: "interactive" }, uiCtx());
+check("answer is consumed", answered?.action === "handled");
+check("planning restarts", entries.at(-1)?.data?.phase === "planning", entries.at(-1)?.data);
+check("answer recorded", entries.at(-1)?.data?.clarifications?.[0]?.includes("Postgres"));
+check("planner told the answers", String(userMessages.at(-1) ?? "").includes("Postgres"));
+
+// --- scenario 21: a plan with unknowns asks the user, then re-plans -------
+console.log("\n[21] plan unknowns -> ask -> re-plan");
+await goal.handler("clear", makeCtx());
+notifications.length = 0;
+userMessages.length = 0;
+await goal.handler("plan 一个有待确认点的目标", uiCtx());
+const planWithUnknowns = {
+	objective: "O",
+	exit: "E",
+	milestones: [{ title: "A", exit: "a" }],
+	unknowns: ["用哪个数据库？", "要不要兼容旧数据？"],
+};
+await settleAndCommit(assistantEvent(JSON.stringify(planWithUnknowns)), uiCtx());
+check("phase awaiting answers", entries.at(-1)?.data?.phase === "awaiting-answers", entries.at(-1)?.data);
+check("questions are the unknowns", entries.at(-1)?.data?.questions?.length === 2);
+check(
+	"questions are a separate prominent block",
+	notifications.some((n) => n.includes("还没定") && n.includes("1. 用哪个数据库")),
+);
+check(
+	"the board notification does not bury them",
+	!notifications.some((n) => n.includes("里程碑") && n.includes("用哪个数据库")),
+);
+const unknownAnswer = await inputHandler({ type: "input", text: "用 Postgres，不兼容旧数据", source: "interactive" }, uiCtx());
+check("answer consumed", unknownAnswer?.action === "handled");
+check("re-planning restarts", entries.at(-1)?.data?.phase === "planning", entries.at(-1)?.data);
+check("clarification recorded", entries.at(-1)?.data?.clarifications?.[0]?.includes("Postgres"));
+// the re-plan still has unknowns, but the round is capped -> straight to confirmation
+await settleAndCommit(assistantEvent(JSON.stringify(planWithUnknowns)), uiCtx());
+check("stubborn unknowns are not re-asked", entries.at(-1)?.data?.phase === "awaiting-confirmation", entries.at(-1)?.data);
+
+// --- scenario 22: bad planner output is fail-closed -----------------------
+console.log("\n[22] planning failure is fail-closed");
+await goal.handler("clear", makeCtx());
+notifications.length = 0;
+await goal.handler("plan 一个会失败的目标", uiCtx());
+await settleAndCommit(assistantEvent("no json here at all"), uiCtx());
+check("no goal is created", entries.at(-1)?.data?.cleared === true, entries.at(-1)?.data);
+check("failure is reported", notifications.some((n) => n.includes("规划失败")), notifications);
+
+// --- scenario 23: plain /goal stays plan-free -----------------------------
+console.log("\n[23] plain /goal unaffected");
+await goal.handler("clear", makeCtx());
+userMessages.length = 0;
+await goal.handler("一个普通目标", makeCtx());
+check("starts directly", userMessages.at(-1) === "一个普通目标");
+check("no plan attached", !entries.at(-1)?.data?.plan);
+
+// --- scenario 24: stopping a draft stops the interception -----------------
+console.log("\n[24] stopped draft is not intercepted");
+await goal.handler("clear", makeCtx());
+await goal.handler("plan 会被停掉的计划", uiCtx());
+await settleAndCommit(
+	assistantEvent(JSON.stringify({ objective: "会被停掉的计划", exit: "E", milestones: [{ title: "A", exit: "a" }] })),
+	uiCtx(),
+);
+await goal.handler("stop", uiCtx());
+const stopped = await inputHandler({ type: "input", text: "同意", source: "interactive" }, makeCtx());
+check("stopped draft does not transform", stopped === undefined, stopped);
+
+// --- scenario 25: the raw plan JSON is collapsed in the transcript --------
+console.log("\n[25] raw plan JSON is collapsed");
+await goal.handler("clear", makeCtx());
+await goal.handler("plan 收起 JSON 的目标", uiCtx());
+const messageEnd = handlers.message_end[0];
+const planJson = JSON.stringify({ objective: "O", exit: "E", milestones: [{ title: "A", exit: "a" }] });
+const replaced = await messageEnd(
+	{ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: planJson }] } },
+	uiCtx(),
+);
+check("planning message replaced", replaced?.message?.content?.[0]?.text === "（已生成计划，见下方看板）", replaced);
+check(
+	"non-plan content untouched",
+	(await messageEnd({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "hello" }] } }, uiCtx())) === undefined,
+);
+// settle still sees the stashed JSON even though the transcript shows the placeholder
+await settleAndCommit(
+	makeEvent({ context: { contextMessages: [{ role: "assistant", content: [{ type: "text", text: "（已生成计划，见下方看板）" }] }] } }),
+	uiCtx(),
+);
+check("stashed JSON still reaches the settle step", entries.at(-1)?.data?.phase === "awaiting-confirmation", entries.at(-1)?.data);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -13,6 +13,7 @@
   "license": "MIT",
   "files": [
     "index.ts",
+    "plan.ts",
     "README.md",
     "LICENSE"
   ],
@@ -33,6 +34,6 @@
   },
   "scripts": {
     "setup": "node test/setup.mjs",
-    "test": "node test/setup.mjs && node test/mock.test.mjs && node test/integration.test.mjs"
+    "test": "node test/setup.mjs && node test/plan.test.mjs && node test/mock.test.mjs && node test/integration.test.mjs"
   }
 }

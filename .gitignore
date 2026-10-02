@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .DS_Store
+
+# 插件自己维护的详细计划文件（会随重规划重写）
+.pi/goal-plans/
