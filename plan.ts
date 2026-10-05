@@ -226,6 +226,21 @@ function clip(text: string, max: number): string {
 	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+/**
+ * The operating rules, written ONCE. The kickoff and every continuation must say the
+ * same thing: they used to be two copies, one saying "stop only when the whole goal is
+ * done" and the other "focus on the current milestone only" — so the agent, following
+ * the kickoff, finished several milestones that the judge then credited one at a time.
+ */
+export function requirementsText(): string {
+	return [
+		"要求：",
+		"- 不要询问我是否继续，直接执行。",
+		"- 对照每一片自己的出口自查；做完了就继续往前推进，不必停下来等判定。",
+		"- 只有目标全部完成、或确实需要我提供信息/做决定时才停下来。",
+	].join("\n");
+}
+
 /** First user message once the plan is confirmed. */
 export function kickoff(plan: Plan): string {
 	const current = currentMilestone(plan);
@@ -236,13 +251,32 @@ export function kickoff(plan: Plan): string {
 		boardText(plan),
 		"",
 		current ? `从 ${current.id}「${current.title}」开始。它的出口是：${current.exit}` : "计划已全部完成。",
-		"完成一项就对照它的出口自查；不要问我是否继续，目标全部完成时才停下来。",
+		"",
+		requirementsText(),
 	].join("\n");
 }
 
 // ---------------------------------------------------------------------------
 // milestone updates
 // ---------------------------------------------------------------------------
+
+function sameMilestone(m: Milestone, key: string): boolean {
+	const k = key.trim().toLowerCase();
+	return Boolean(k) && (m.id.toLowerCase() === k || m.title.toLowerCase() === k);
+}
+
+/**
+ * The milestones to tick this round: the current one, then on through `throughId`.
+ * The judge may only extend the range FORWARD (a missing, unknown or earlier id
+ * means "just the current one"), so a weak verdict can never tick a later plate.
+ */
+export function milestoneRange(plan: Plan, throughId?: string): string[] {
+	const current = currentMilestone(plan);
+	if (!current) return [];
+	const start = plan.milestones.indexOf(current);
+	const end = throughId ? plan.milestones.findIndex((m) => sameMilestone(m, throughId)) : -1;
+	return plan.milestones.slice(start, Math.max(start, end) + 1).map((m) => m.id);
+}
 
 /** Mark milestones done by id or exact title. Idempotent; unknown keys are ignored. */
 export function markDone(plan: Plan, keys: string[], evidence?: string): Plan {

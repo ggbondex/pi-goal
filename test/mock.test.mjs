@@ -342,7 +342,7 @@ check("current milestone marked done", entries.at(-1)?.data?.plan?.milestones?.[
 check("loop continues to the next milestone", planResult?.continue === true);
 check("continuation names the new current milestone", String(planResult?.entries?.find((e) => e.type === "custom_message")?.content ?? "").includes("m2"));
 
-// --- scenario 19: done is overruled while milestones remain ---------------
+// --- scenario 19: done without done_through advances only the current one ---
 console.log("\n[19] plan advances one milestone at a time");
 judgeReply = { done: true, blocked: false, reason: "m2 完成", next: "" };
 planResult = await settleAndCommit(makeEvent(), makeCtx());
@@ -356,6 +356,35 @@ planResult = await settleAndCommit(makeEvent(), makeCtx());
 check("finishes once every milestone is done", !planResult || planResult.continue !== true);
 check("stop reason done", entries.at(-1)?.data?.stopReason === "done");
 check("all milestones done", entries.at(-1)?.data?.plan?.milestones?.every((m) => m.status === "done"));
+judgeReply = { done: false, blocked: false, reason: "not yet", next: "do X" };
+
+// --- scenario 19b: done_through credits the whole verified stretch --------
+console.log("\n[19b] done_through credits several milestones in one round");
+await goal.handler("clear", makeCtx());
+notifications.length = 0;
+userMessages.length = 0;
+await goal.handler("plan 一个一口气能干完的目标", uiCtx());
+await settleAndCommit(assistantEvent(JSON.stringify(planObj)), uiCtx());
+const multiConfirmed = await inputHandler({ type: "input", text: "同意", source: "interactive" }, uiCtx());
+check("confirm transforms into the kickoff", multiConfirmed?.action === "transform", multiConfirmed);
+check("judge prompt asks how far the evidence goes", lastJudgePrompt.includes("done_through"), lastJudgePrompt.slice(-300));
+judgeReply = { done: true, blocked: false, reason: "m1 与 m2 各自的出口都跑过", next: "做 m3", done_through: "m2" };
+planResult = await settleAndCommit(makeEvent(), makeCtx());
+check(
+	"ticks the whole stretch, not just the current one",
+	entries.at(-1)?.data?.plan?.milestones?.map((m) => m.status).join(",") === "done,done,todo",
+	entries.at(-1)?.data?.plan?.milestones,
+);
+check("a later milestone stays if outside the stretch", entries.at(-1)?.data?.plan?.milestones?.[2]?.status === "todo");
+check("still continues with m3 left", planResult?.continue === true, planResult);
+check(
+	"continuation reports how far it got",
+	String(planResult?.entries?.find((e) => e.type === "custom_message")?.content ?? "").includes("已认到 2/3 片"),
+	planResult?.entries?.find((e) => e.type === "custom_message")?.content,
+);
+judgeReply = { done: true, blocked: false, reason: "m3 出口也跑过", next: "", done_through: "m3" };
+planResult = await settleAndCommit(makeEvent(), makeCtx());
+check("the last stretch finishes the goal", entries.at(-1)?.data?.stopReason === "done" && !planResult?.continue);
 judgeReply = { done: false, blocked: false, reason: "not yet", next: "do X" };
 
 // --- scenario 20: the planner asks questions; the reply re-plans ----------
@@ -454,6 +483,57 @@ await settleAndCommit(
 	uiCtx(),
 );
 check("stashed JSON still reaches the settle step", entries.at(-1)?.data?.phase === "awaiting-confirmation", entries.at(-1)?.data);
+
+// --- scenario 26: the planner's JSON survives losing an in-memory copy -----
+// Reported from the field: a planning turn that plainly produced a plan (the
+// transcript held the placeholder, which only `message_end` writes after a
+// successful parse) died with "planner returned no JSON object". The JSON lived
+// in one variable that several paths clear; now it is persisted with the state.
+console.log("\n[26] planning JSON survives losing the in-memory copy");
+await goal.handler("clear", makeCtx());
+notifications.length = 0;
+await goal.handler("plan 会被丢 stash 的目标", uiCtx());
+const durable = JSON.stringify({ objective: "O2", exit: "E2", milestones: [{ title: "A", exit: "a" }] });
+await messageEnd({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: durable }] } }, uiCtx());
+check("state carries a durable copy of the JSON", entries.at(-1)?.data?.pendingPlanRaw === durable, entries.at(-1)?.data);
+await settleAndCommit(assistantEvent("（已生成计划，见下方看板）"), uiCtx());
+check("settles from the stash", entries.at(-1)?.data?.phase === "awaiting-confirmation", entries.at(-1)?.data);
+check("durable copy cleared once used", entries.at(-1)?.data?.pendingPlanRaw === undefined, entries.at(-1)?.data);
+
+// --- scenario 27: every copy gone -> name the real cause, stay fail-closed --
+console.log("\n[27] every copy gone -> internal loss is named as such");
+await goal.handler("clear", makeCtx());
+notifications.length = 0;
+await goal.handler("plan 会丢 JSON 的目标", uiCtx());
+await settleAndCommit(assistantEvent("（已生成计划，见下方看板）"), uiCtx());
+check("fail-closed (no goal is created)", entries.at(-1)?.data?.cleared === true, entries.at(-1)?.data);
+check("names the internal loss", notifications.some((n) => n.includes("插件内部状态")), notifications);
+check(
+	"does not blame the model",
+	!notifications.some((n) => n.includes("planner returned no JSON")),
+	notifications,
+);
+
+// --- scenario 28: the picker itself ---------------------------------------
+console.log("\n[28] pickPendingPlanRaw");
+const pickPendingPlanRaw = mod.pickPendingPlanRaw ?? mod.default?.pickPendingPlanRaw;
+check("exported for tests", typeof pickPendingPlanRaw === "function", Object.keys(mod));
+if (typeof pickPendingPlanRaw === "function") {
+	check("memory wins", pickPendingPlanRaw('{"a":1}', '{"b":2}', "x").source === "memory");
+	check(
+		"the durable copy beats the placeholder",
+		pickPendingPlanRaw("", '{"b":2}', "（已生成计划，见下方看板）").source === "state",
+	);
+	check(
+		"the placeholder is reported as a placeholder",
+		pickPendingPlanRaw("", undefined, "（已生成计划，见下方看板）").source === "placeholder",
+	);
+	check("nothing at all is empty", pickPendingPlanRaw("", undefined, "   ").source === "empty");
+	check(
+		"real planner output still comes from the transcript",
+		pickPendingPlanRaw("", undefined, '{"objective":"O"}').source === "transcript",
+	);
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

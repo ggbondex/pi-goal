@@ -66,10 +66,12 @@ import {
 	isPlanComplete,
 	kickoff,
 	markDone,
+	milestoneRange,
 	parsePlannerReply,
 	planFilePath,
 	questionsText,
 	readPlanFile,
+	requirementsText,
 	type Plan,
 	type PlanSource,
 	type PlannerReply,
@@ -78,6 +80,9 @@ import {
 const ENTRY_TYPE = "goal-loop";
 const MESSAGE_TYPE = "goal-loop-continuation";
 const STATUS_KEY = "goal-loop";
+/** What `message_end` shows instead of the planning turn's raw JSON. */
+const PLANNING_PLACEHOLDER = "（已生成计划，见下方看板）";
+const DEBUG = process.env.PI_GOAL_DEBUG === "1" || process.env.PI_GOAL_DEBUG === "true";
 
 const DEFAULT_MAX_ITERATIONS = 15;
 const MAX_JUDGE_ERRORS = 3;
@@ -119,6 +124,8 @@ interface Verdict {
 	blocked: boolean;
 	reason: string;
 	next: string;
+	/** Last milestone the judge found verifiably done (plan mode); extends the tick range forward. */
+	doneThrough?: string;
 }
 
 interface GoalState {
@@ -147,6 +154,16 @@ interface GoalState {
 	clarifications?: string[];
 	/** True once we have already asked the user about a plan's unknowns. */
 	askedUnknowns?: boolean;
+	/**
+	 * The planning turn's raw JSON, written by `message_end`.
+	 *
+	 * It has to live here as well as in memory: `message_end` replaces the message
+	 * text with a placeholder, so after that the transcript no longer holds the
+	 * JSON, and several paths clear the in-memory copy (the settle that consumes
+	 * it, a re-plan, a reload). With only the memory copy, any of those turned a
+	 * perfectly good plan into "planner returned no JSON object".
+	 */
+	pendingPlanRaw?: string;
 	lastVerdict?: Verdict;
 	createdAt: number;
 	updatedAt: number;
@@ -168,6 +185,31 @@ function asString(value: unknown): string {
 
 function asBool(value: unknown): boolean {
 	return value === true || value === "true" || value === 1;
+}
+
+export type PendingPlanSource = "memory" | "state" | "transcript" | "placeholder" | "empty";
+
+/**
+ * Which copy of the planner's JSON the settle step should use.
+ *
+ * `message_end` swaps the planning turn's text for a placeholder, so the
+ * transcript can hold the placeholder and nothing else. Falling back to that
+ * text made the plugin report "planner returned no JSON object" for plans it had
+ * parsed itself seconds earlier — the model was never at fault. So the
+ * transcript is only used when it genuinely looks like planner output, and the
+ * placeholder is reported as what it is: an internal copy loss.
+ */
+export function pickPendingPlanRaw(
+	memoryRaw: string,
+	stateRaw: string | undefined,
+	transcriptRaw: string,
+): { raw: string; source: PendingPlanSource } {
+	if (memoryRaw.trim()) return { raw: memoryRaw, source: "memory" };
+	if ((stateRaw ?? "").trim()) return { raw: stateRaw ?? "", source: "state" };
+	const transcript = transcriptRaw.trim();
+	if (!transcript) return { raw: "", source: "empty" };
+	if (transcript === PLANNING_PLACEHOLDER) return { raw: "", source: "placeholder" };
+	return { raw: transcriptRaw, source: "transcript" };
 }
 
 function stateDraft(state: GoalState): SessionBoundaryDraft {
@@ -235,27 +277,29 @@ function buildJudgePrompt(objective: string, transcript: string, plan?: Plan): s
 	if (plan && current) {
 		lines.push(
 			"",
-			"You are judging ONE milestone of this plan, NOT the whole goal.",
+			"You are judging how far this plan has actually advanced, starting at the CURRENT milestone.",
 			`CURRENT MILESTONE: ${current.id} ${current.title}`,
 			`ITS EXIT (done when): ${current.exit}`,
 			"",
-			"Decide whether THIS milestone is DONE, using ONLY evidence in the transcript.",
+			"Decide which milestones, starting at the current one, are DONE — using ONLY evidence in the transcript.",
 			"",
 			"Rules:",
 			"- Require concrete evidence in the transcript: files created or edited, commands run and their results, tests passing. A claim alone is not evidence.",
-			"- Judge only this milestone. A later milestone being done does not finish this one, and later milestones are not required here.",
+			"- Each milestone needs ITS OWN exit criterion satisfied. Evidence that matches a different milestone never counts for this one.",
+			"- answer done_through = the LAST milestone the evidence supports, counting from the current one, with every milestone in between ALSO supported. If the current milestone itself is not done: done=false and an empty done_through.",
+			"- Later milestones are NOT required: stopping at the current one is a normal, correct answer. Never guess a later milestone forward.",
 			"- The agent asking \"shall I continue?\" / writing a summary and pausing is NOT done: answer done=false and name the next concrete step.",
 			"- Out of context / a length limit / asking for a fresh session is NOT a blocker; the harness compacts and continues. Answer done=false and name the next concrete step.",
 			"- Set blocked=true only when the agent genuinely cannot proceed without new information, credentials, or a decision only the user can supply.",
-			"- If the milestone is not done, next must be a single concrete step toward it.",
+			"- next must be a single concrete step: toward the current milestone when not done, otherwise the step that follows done_through.",
 			"",
-			"ALL MILESTONES (context only; [>] is the one you are judging):",
+			"ALL MILESTONES (context only; [>] is where you start judging):",
 			...plan.milestones.map(
 				(m) => `- [${m.status === "done" ? "x" : m.id === current.id ? ">" : " "}] ${m.id} ${m.title} — ${m.exit}`,
 			),
 			"",
 			"Reply with ONE JSON object and nothing else (no markdown fences, no prose):",
-			'{"done": <boolean: is the CURRENT MILESTONE done?>, "blocked": <boolean>, "reason": "<one or two sentences>", "next": "<single concrete next action>"}',
+			'{"done": <boolean: is the CURRENT MILESTONE done?>, "done_through": "<milestone id: the last one the evidence supports, \"\" if none>", "blocked": <boolean>, "reason": "<one or two sentences>", "next": "<single concrete next action>"}',
 		);
 	} else {
 		lines.push(
@@ -281,9 +325,10 @@ function buildJudgePrompt(objective: string, transcript: string, plan?: Plan): s
 
 function buildContinuation(objective: string, verdict: Verdict, iteration: number, max: number, plan?: Plan): string {
 	const step = verdict.next.trim() || "继续推进当前里程碑，直到它完成并自行验证。";
+	const credited = plan ? plan.milestones.filter((m) => m.status === "done").length : 0;
 	const head = plan
 		? verdict.done
-			? "上一轮的里程碑已完成，已自动进入下一片。"
+			? `上一轮的里程碑已完成（已认到 ${credited}/${plan.milestones.length} 片），已自动进入下一片。`
 			: "当前里程碑尚未完成，已自动接续，无需等待用户确认。"
 		: "上一轮结束时目标尚未完成，现已自动接续，无需等待用户确认。";
 	const lines = [
@@ -307,10 +352,7 @@ function buildContinuation(objective: string, verdict: Verdict, iteration: numbe
 	}
 	lines.push(
 		"",
-		"要求：",
-		"- 不要询问我是否继续，直接执行。",
-		"- 只专注当前里程碑；每完成一步自行验证（跑测试 / 读回文件 / 检查命令输出）。",
-		"- 只有当你确信当前里程碑完成、或确实需要我提供信息/做决定时才停下来。",
+		requirementsText(),
 	);
 	return lines.join("\n");
 }
@@ -496,8 +538,11 @@ export default function goalLoop(pi: ExtensionAPI): void {
 					asString(obj.nextStep) ||
 					asString(obj.next_action) ||
 					"";
+				const doneThrough =
+					asString(obj.done_through) || asString(obj.doneThrough) || asString(obj.through) || "";
 				return {
 					done,
+					doneThrough: done ? doneThrough : "",
 					blocked: done ? false : blocked,
 					reason: reason || (done ? "judge: done" : "judge: not done"),
 					next: done ? "" : next,
@@ -575,14 +620,30 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		if (event.outcome === "aborted") return cancel("🎯 规划已取消。", "warning");
 		if (event.outcome === "error") return cancel("🎯 规划以错误结束，已取消。", "error");
 
-		const raw = planningOutput || lastAssistantText(event);
-		planningOutput = "";
+		// Never read the transcript blindly: `message_end` put a placeholder there,
+		// so the only correct sources are the in-memory stash and the persisted
+		// copy, in that order.
+		const picked = pickPendingPlanRaw(planningOutput, s.pendingPlanRaw, lastAssistantText(event));
 		let reply: PlannerReply;
 		try {
-			reply = parsePlannerReply(raw);
+			reply = parsePlannerReply(picked.raw);
 		} catch (err) {
+			if (picked.source === "placeholder") {
+				return cancel("🎯 规划失败：这一轮的 JSON 丢了（插件内部状态，不是模型没给）—— 请重跑 /goal plan。", "error");
+			}
+			if (picked.source === "empty") {
+				return cancel("🎯 规划失败：规划回合没有给出任何内容。", "error");
+			}
 			return cancel(`🎯 规划失败，未启动：${err instanceof Error ? err.message : String(err)}`, "error");
 		}
+		// Consumed. Drop the copies only now, so a failed parse above leaves them
+		// available for a retry instead of throwing the plan away.
+		planningOutput = "";
+		if (s.pendingPlanRaw) {
+			s = { ...s, pendingPlanRaw: undefined };
+			state = s;
+		}
+		if (DEBUG) console.error(`[goal] planning JSON settled from ${picked.source}`);
 
 		if (reply.kind === "questions") {
 			state = { ...s, phase: "awaiting-answers", questions: reply.questions, updatedAt: Date.now() };
@@ -670,10 +731,18 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			return;
 		}
 		planningOutput = text;
+		// Durable copy. The line below erases the JSON from the transcript, so the
+		// in-memory variable becomes the only other place it exists — and that one
+		// gets cleared by the settle that consumes it, by a re-plan, and by a
+		// reload. Persist it with the state so a lost copy is recoverable.
+		if (state) {
+			state = { ...state, pendingPlanRaw: text };
+			persist();
+		}
 		return {
 			message: {
 				...(event.message as object),
-				content: [{ type: "text", text: "（已生成计划，见下方看板）" }],
+				content: [{ type: "text", text: PLANNING_PLACEHOLDER }],
 			} as typeof event.message,
 		};
 	});
@@ -859,13 +928,15 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			return { entries };
 		}
 
-		// In plan mode the judge answers a narrow question: is the CURRENT milestone
-		// done? Tick it and advance. The goal is done only when every milestone is
-		// ticked — so the plan, not the model, defines completeness.
+		// In plan mode the judge answers a narrow question: from the current milestone,
+		// how far does the evidence go? Tick that whole stretch in one round, not one
+		// plate per round — the agent routinely finishes several plates in a single
+		// turn, and crediting them one at a time is what made the loop look laggy.
+		// The goal is done only when every milestone is ticked — so the plan, not the
+		// model, defines completeness.
 		let plan = s.plan;
 		if (plan && verdict.done) {
-			const current = currentMilestone(plan);
-			if (current) plan = markDone(plan, [current.id], verdict.reason);
+			plan = markDone(plan, milestoneRange(plan, verdict.doneThrough), verdict.reason);
 		}
 		const goalDone = verdict.done && (!plan || isPlanComplete(plan));
 
@@ -929,6 +1000,12 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			}
 		}
 		planningOutput = "";
+		if (state?.pendingPlanRaw) {
+			// A fresh planning turn makes the previous turn's copy stale.
+			if (DEBUG) console.error("[goal] dropping the previous planning JSON (new planning turn)");
+			state = { ...state, pendingPlanRaw: undefined };
+			persist();
+		}
 		pi.sendUserMessage(buildPlanningInstruction(intent, fileText, clarifications, detailFile));
 	}
 

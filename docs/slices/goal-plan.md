@@ -17,3 +17,9 @@
 - 判据：`test/plan.test.mjs` **64/0** · `test/mock.test.mjs` **88/0**（含 16–25：调研→确认→驱动→**一次推进一片**→完成、`needs_answers`、unknowns 提问、规划失败 fail-closed、普通 `/goal` 不受影响、停掉的草案不再拦截、原始 JSON 收起）· `test/integration.test.mjs` OK。
 - 无远程/部署层（本地扩展），验收 = 你在 pi 里跑一次 `/goal plan`。
 - 耐久部分已并入 `README.md`；你手验通过后本片可删。
+
+## 后续修订（2026-10，真链路暴露）
+
+- **一轮认一片 → 一轮认一段**：判定多回一个 `done_through`（证据连续支持的最后一~片），循环一次 tick 当前片到那里（`index.ts` 的 tick 用 `plan.ts:milestoneRange`）。区间只向前；缺省 = 只有当前片。起因：8 片计划里 agent 一轮就把 m1–m6 都干完了，判定却一次只认一片，看着像"判定滞后"。
+- **口径统一到一处**：开工轮与续跑共用 `plan.ts:requirementsText()`。原来开工轮说"目标全部完成时才停下来"、续跑说"只专注当前里程碑"—— agent 照前者一口气干几片，判定照后者一次只认一片，就是上面那个滞后的放大器。
+- 判据仍是 `npm test`（plan 71/0 · mock 110/0 · integration OK）；新增用例：`milestoneRange` 的边界（缺省/向前/给早了/未知 id）+ mock 19b（`done_through: m2` 一轮 tick 两片、m3 留着；再 `done_through: m3` 收尾）。

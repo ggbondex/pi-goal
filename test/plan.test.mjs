@@ -47,6 +47,31 @@ try {
 }
 check("throws on no objective", threw);
 
+console.log("[plan] milestoneRange");
+const rangePlan = plan.parsePlan(
+	'{"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a"},{"title":"B","exit":"b"},{"title":"C","exit":"c"},{"title":"D","exit":"d"}]}',
+);
+check(
+	"no through id -> just the current one",
+	JSON.stringify(plan.milestoneRange(rangePlan)) === JSON.stringify(["m1"]),
+);
+check(
+	"through a later id -> the whole stretch from the current one",
+	JSON.stringify(plan.milestoneRange(rangePlan, "m3")) === JSON.stringify(["m1", "m2", "m3"]),
+);
+check(
+	"accepts a title",
+	JSON.stringify(plan.milestoneRange(rangePlan, "D")) === JSON.stringify(["m1", "m2", "m3", "m4"]),
+);
+check(
+	"unknown id -> no over-tick",
+	JSON.stringify(plan.milestoneRange(rangePlan, "m99")) === JSON.stringify(["m1"]),
+);
+check(
+	"earlier id -> no over-tick",
+	JSON.stringify(plan.milestoneRange(plan.markDone(rangePlan, ["m1"]), "m1")) === JSON.stringify(["m2"]),
+);
+
 console.log("[plan] board");
 let p = plan.parsePlan('{"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a"},{"title":"B","exit":"b"},{"title":"C","exit":"c"}]}');
 check("current is the first milestone", plan.currentMilestone(p).id === "m1");
@@ -64,6 +89,14 @@ check("board marks done with ✅", plan.boardText(p).includes("✅ m1") && plan.
 check("markDone is idempotent", plan.markDone(p, ["A"], "again").milestones[0].evidence === "evidence");
 p = plan.markDone(p, ["C"]);
 check("complete when all done", plan.isPlanComplete(p) === true);
+
+console.log("[plan] requirements");
+const req = plan.requirementsText();
+check(
+	"requirements push forward instead of waiting for the judge",
+	req.includes("继续往前推进") && !req.includes("只专注当前里程碑"),
+);
+check("kickoff carries the same requirements", plan.kickoff(rangePlan).includes(req));
 
 console.log("[plan] classifyReply");
 for (const t of ["同意", "可以", "开始", "开始吧", "好的", "OK", "yes", "确认"]) {
