@@ -1,6 +1,13 @@
 /**
  * Pure-function tests for the plan module. No model, no network, no cost.
+ *
+ * The plan module is deliberately small: one prompt, one parser for the plan
+ * file's two header fields, one preview, one handoff. There is no milestone
+ * state machine left to test — that was the point.
  */
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url, { interopDefault: true });
@@ -18,181 +25,105 @@ function check(name, condition, extra) {
 	}
 }
 
-console.log("[plan] parsePlan");
-const parsed = plan.parsePlan(
-	'```json\n{"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a","why":"first"},{"title":"B","exit":"b"}]}\n```',
-);
-check("assigns ids", parsed.milestones[0].id === "m1" && parsed.milestones[1].id === "m2");
-check("all start todo", parsed.milestones.every((m) => m.status === "todo"));
-check("keeps title/exit/why", parsed.milestones[0].title === "A" && parsed.milestones[0].exit === "a" && parsed.milestones[0].why === "first");
-let threw = false;
-try {
-	plan.parsePlan("no json here");
-} catch {
-	threw = true;
-}
-check("throws on no JSON", threw);
-threw = false;
-try {
-	plan.parsePlan('{"objective":"O","exit":"E","milestones":[]}');
-} catch {
-	threw = true;
-}
-check("throws on no milestones", threw);
-threw = false;
-try {
-	plan.parsePlan('{"exit":"E","milestones":[{"title":"A","exit":"a"}]}');
-} catch {
-	threw = true;
-}
-check("throws on no objective", threw);
+const sandbox = mkdtempSync(path.join(os.tmpdir(), "pi-goal-plan-"));
 
-console.log("[plan] milestoneRange");
-const rangePlan = plan.parsePlan(
-	'{"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a"},{"title":"B","exit":"b"},{"title":"C","exit":"c"},{"title":"D","exit":"d"}]}',
-);
+console.log("[plan] header values");
+check("plain label", plan.headerValue("目标：把登录超时修好", "目标") === "把登录超时修好");
+check("bold label", plan.headerValue("**目标**：把登录超时修好", "目标") === "把登录超时修好");
+check("heading label", plan.headerValue("# 出口: ./run.sh", "出口") === "./run.sh");
+check("quoted label", plan.headerValue("> 出口：make check", "出口") === "make check");
+check("value can contain the other separator", plan.headerValue("出口：curl a:b", "出口") === "curl a:b");
+check("absent label is undefined", plan.headerValue("目标：X\n\n正文", "出口") === undefined);
+check("empty value is not a value", plan.headerValue("出口：   ", "出口") === undefined);
+check("the first hit wins", plan.headerValue("目标：一\n目标：二", "目标") === "一");
+check("label inside the body still counts (it is the same marker)", plan.headerValue("正文\n\n目标：一", "目标") === "一");
 check(
-	"no through id -> just the current one",
-	JSON.stringify(plan.milestoneRange(rangePlan)) === JSON.stringify(["m1"]),
-);
-check(
-	"through a later id -> the whole stretch from the current one",
-	JSON.stringify(plan.milestoneRange(rangePlan, "m3")) === JSON.stringify(["m1", "m2", "m3"]),
-);
-check(
-	"accepts a title",
-	JSON.stringify(plan.milestoneRange(rangePlan, "D")) === JSON.stringify(["m1", "m2", "m3", "m4"]),
-);
-check(
-	"unknown id -> no over-tick",
-	JSON.stringify(plan.milestoneRange(rangePlan, "m99")) === JSON.stringify(["m1"]),
-);
-check(
-	"earlier id -> no over-tick",
-	JSON.stringify(plan.milestoneRange(plan.markDone(rangePlan, ["m1"]), "m1")) === JSON.stringify(["m2"]),
+	"a label with no separator is not a header",
+	plan.headerValue("目标是把这件事做完", "目标") === undefined,
 );
 
-console.log("[plan] board");
-let p = plan.parsePlan('{"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a"},{"title":"B","exit":"b"},{"title":"C","exit":"c"}]}');
-check("current is the first milestone", plan.currentMilestone(p).id === "m1");
-check("not complete at start", plan.isPlanComplete(p) === false);
-check("board marks current with ▶", plan.boardText(p).includes("▶ m1"));
-check("board marks the rest with ·", plan.boardText(p).includes("· m2") && plan.boardText(p).includes("· m3"));
+console.log("[plan] readPlanDraft");
+const goodPlan = "目标：给助手加记笔记能力\n出口：make check && make test\n\n## 路线\n1. 契约\n";
+writeFileSync(path.join(sandbox, "good.md"), goodPlan);
+mkdirSync(path.join(sandbox, ".pi", "goal-plans"), { recursive: true });
+writeFileSync(path.join(sandbox, ".pi", "goal-plans", "nested.md"), goodPlan);
+writeFileSync(path.join(sandbox, "no-objective.md"), "出口：make check\n");
+writeFileSync(path.join(sandbox, "empty.md"), "");
 
-p = plan.markDone(p, ["A", "m2"], "evidence");
-check("marks by title", p.milestones[0].status === "done");
-check("marks by id", p.milestones[1].status === "done");
-check("records evidence", p.milestones[0].evidence === "evidence");
-check("unknown keys ignored", p.milestones[2].status === "todo");
-check("current advances", plan.currentMilestone(p).id === "m3");
-check("board marks done with ✅", plan.boardText(p).includes("✅ m1") && plan.boardText(p).includes("✅ m2"));
-check("markDone is idempotent", plan.markDone(p, ["A"], "again").milestones[0].evidence === "evidence");
-p = plan.markDone(p, ["C"]);
-check("complete when all done", plan.isPlanComplete(p) === true);
+const draft = await plan.readPlanDraft("good.md", sandbox);
+check("reads the objective", draft?.objective === "给助手加记笔记能力", draft);
+check("reads the exit", draft?.exit === "make check && make test", draft);
+check("works for the plugin-owned path", (await plan.readPlanDraft(".pi/goal-plans/nested.md", sandbox))?.objective?.startsWith("给助手"));
+check("a file without 目标 is NOT a plan", (await plan.readPlanDraft("no-objective.md", sandbox)) === null);
+check("an empty file is NOT a plan", (await plan.readPlanDraft("empty.md", sandbox)) === null);
+check("a missing file is NOT a plan", (await plan.readPlanDraft("nope.md", sandbox)) === null);
+writeFileSync(path.join(sandbox, "no-exit.md"), "目标：只有目标\n正文\n");
+const noExit = await plan.readPlanDraft("no-exit.md", sandbox);
+check("the exit is optional", noExit?.objective === "只有目标" && noExit?.exit === "", noExit);
 
-console.log("[plan] requirements");
-const req = plan.requirementsText();
+console.log("[plan] planPreview");
+const longPlan = ["目标：O", "出口：E", ...Array.from({ length: 30 }, (_, i) => `行 ${i}`)].join("\n");
+const preview = plan.planPreview(longPlan, 5);
+check("caps the lines", preview.text.split("\n").length === 5, preview);
+check("says there is more", preview.more === true);
+check("short plan is not truncated", plan.planPreview("目标：O\n出口：E\n", 5).more === false);
+check("trailing blank lines are dropped", plan.planPreview("目标：O\n\n\n", 5).text === "目标：O");
+
+console.log("[plan] kickoff + requirements");
+const kick = plan.kickoff("目标句", "make check", ".pi/goal-plans/x.md");
+check("names the objective", kick.includes("目标句"));
+check("names the exit", kick.includes("make check"));
+check("points at the plan file", kick.includes(".pi/goal-plans/x.md"));
+check("carries the rules", kick.includes("不要询问我是否继续"));
+const plainKick = plan.kickoff("目标句", "");
+check("plain goals get no exit line", !plainKick.includes("出口："));
+check("plain goals get no plan line", !plainKick.includes("详细计划："));
 check(
-	"requirements push forward instead of waiting for the judge",
-	req.includes("继续往前推进") && !req.includes("只专注当前里程碑"),
+	"the rules text has exactly one source",
+	plan.requirementsText().split("\n")[0] === "要求：" && kick.includes(plan.requirementsText()),
 );
-check("kickoff carries the same requirements", plan.kickoff(rangePlan).includes(req));
 
 console.log("[plan] classifyReply");
-for (const t of ["同意", "可以", "开始", "开始吧", "好的", "OK", "yes", "确认"]) {
-	check(`yes: ${t}`, plan.classifyReply(t) === "yes");
-}
-for (const t of ["取消", "不用了", "算了", "no", "stop"]) {
-	check(`no: ${t}`, plan.classifyReply(t) === "no");
-}
-check("revision: a sentence", plan.classifyReply("第三个里程碑太大了，拆开") === "revise");
-check("revision: empty", plan.classifyReply("") === "revise");
+check("同意", plan.classifyReply("同意") === "yes");
+check("同意吧", plan.classifyReply("同意吧") === "yes");
+check("ok 大小写与标点", plan.classifyReply("OK！") === "yes");
+check("不用了", plan.classifyReply("不用了") === "no");
+check("取消", plan.classifyReply("取消") === "no");
+check("空回复按修改处理", plan.classifyReply("   ") === "revise");
+check("其他文本按修改处理", plan.classifyReply("把数据库换成 Postgres") === "revise");
+check("不要被 substring 骗到", plan.classifyReply("different") === "revise");
 
-console.log("[plan] findPlanFile");
-check("explicit @path", plan.findPlanFile("做这个 @docs/PLAN.md") === "docs/PLAN.md");
-check("bare .md token", plan.findPlanFile("参考 docs/IMPLEMENTATION_PLAN.md 做") === "docs/IMPLEMENTATION_PLAN.md");
-check("none", plan.findPlanFile("给助手加个功能") === undefined);
-
-console.log("[plan] kickoff");
-const k = plan.kickoff(parsed);
-check("kickoff carries the objective", k.includes("O"));
-check("kickoff names the current milestone", k.includes("m1") && k.includes("A"));
-
-console.log("[plan] parsePlannerReply");
-let reply = plan.parsePlannerReply('{"needs_answers":["q1","q2"]}');
-check("questions reply", reply.kind === "questions" && reply.questions.length === 2);
-reply = plan.parsePlannerReply('{"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a"}],"unknowns":["u"]}');
-check("plan reply", reply.kind === "plan" && reply.plan.objective === "O");
-check("plan reply keeps unknowns", reply.plan.unknowns?.[0] === "u");
-threw = false;
-try {
-	plan.parsePlannerReply("nothing");
-} catch {
-	threw = true;
-}
-check("throws on no JSON", threw);
+console.log("[plan] paths");
+check("explicit @path wins", plan.findPlanFile("做 @docs/IMPLEMENTATION_PLAN.md 里的事") === "docs/IMPLEMENTATION_PLAN.md");
+check("a bare *.md is picked up", plan.findPlanFile("按 docs/plan.md 做") === "docs/plan.md");
+check("no file", plan.findPlanFile("修登录超时") === undefined);
 check(
-	"empty needs_answers falls through to a plan",
-	plan.parsePlannerReply('{"needs_answers":[],"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a"}]}').kind === "plan",
+	"plan file is plugin-owned and slugged",
+	plan.planFilePath("给助手加记笔记能力").startsWith(".pi/goal-plans/") && !plan.planFilePath("给助手加记笔记能力").includes(" "),
+);
+check("empty intent still yields a path", plan.planFilePath("!!!") === ".pi/goal-plans/plan.md");
+
+console.log("[plan] the prompt");
+const prompt = plan.buildPlanningInstruction("做点事", undefined, undefined, ".pi/goal-plans/x.md");
+check("says it is the planning stage", prompt.includes("planning stage"));
+check("tells it to research first", prompt.includes("Research first"));
+check("names the file to write", prompt.includes(".pi/goal-plans/x.md"));
+check("states the header contract", prompt.includes(`${plan.PLAN_OBJECTIVE_LABEL}：`) && prompt.includes(`${plan.PLAN_EXIT_LABEL}：`));
+check("says the plan is a document, not a ledger", prompt.includes("no memory of this"));
+check("says to ask instead of inventing", prompt.includes("do NOT write"));
+check("carries the intent verbatim", prompt.includes("做点事"));
+const withFile = plan.buildPlanningInstruction("做点事", "旧计划正文", ["用 Postgres"], ".pi/goal-plans/x.md");
+check("includes the referenced file", withFile.includes("旧计划正文"));
+check("includes the clarifications", withFile.includes("用 Postgres"));
+check("forbids editing the user's file", withFile.includes("Do NOT modify the file the user pointed at"));
+const bare = plan.buildPlanningInstruction("做点事");
+check("works with no file at all", bare.includes("Do not modify anything else"));
+check(
+	"the labels the prompt asks for are the ones the parser reads",
+	plan.headerValue(`${plan.PLAN_OBJECTIVE_LABEL}：X\n${plan.PLAN_EXIT_LABEL}：Y`, plan.PLAN_OBJECTIVE_LABEL) === "X",
 );
 
-console.log("[plan] buildPlanningInstruction");
-const instruction = plan.buildPlanningInstruction("加记笔记", "FILE TEXT", ["用 Postgres"]);
-check("demands research", instruction.includes("Research first"));
-check("demands grounded checks", instruction.includes("must exist in this repo"));
-check("demands coverage of the difference", instruction.includes("cover the full difference"));
-check("includes the intent", instruction.includes("加记笔记"));
-check("includes the file", instruction.includes("FILE TEXT"));
-check("includes clarifications", instruction.includes("用 Postgres"));
-check("asks for needs_answers", instruction.includes("needs_answers"));
-check("asks for unknowns", instruction.includes("unknowns"));
-check("demands a terse JSON-only reply", instruction.includes("NOTHING else") && instruction.includes("ONE sentence"));
-
-console.log("[plan] detail file");
-check(
-	"planFilePath is a plugin-owned .md path",
-	plan.planFilePath("给助手加记笔记能力").startsWith(".pi/goal-plans/") && plan.planFilePath("给助手加记笔记能力").endsWith(".md"),
-);
-check("planFilePath is stable", plan.planFilePath("X") === plan.planFilePath("X"));
-const withFile = plan.buildPlanningInstruction("I", undefined, [], ".pi/goal-plans/x.md");
-check("instruction names the detail file", withFile.includes(".pi/goal-plans/x.md"));
-check("instruction protects the user's file", withFile.includes("Do NOT modify the file the user pointed at"));
-const detailed = plan.parsePlan('{"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a"}]}');
-detailed.detailFile = ".pi/goal-plans/x.md";
-check("board shows the detail pointer", plan.boardText(detailed).includes("详情 .pi/goal-plans/x.md"));
-const runBoard = plan.boardText(plan.parsePlan('{"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a"}]}'), { iterations: 3, maxIterations: 15 });
-check("board labels progress and the run counters", runBoard.includes("里程碑 0/1 · 循环 3/15"));
-check("board omits run counters when unknown", !plan.boardText(detailed).includes("循环"));
-
-console.log("[plan] unknowns become questions");
-const withUnknowns = plan.parsePlan('{"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a"}],"unknowns":["check X","check Y"]}');
-check("board itself does not bury the questions", !plan.boardText(withUnknowns).includes("check X"));
-const unknownQuestions = plan.questionsText(withUnknowns);
-check(
-	"questions are their own prominent block",
-	unknownQuestions.includes("还没定") && unknownQuestions.includes("1. check X") && unknownQuestions.includes("2. check Y"),
-);
-check(
-	"no questions -> empty",
-	plan.questionsText(plan.parsePlan('{"objective":"O","exit":"E","milestones":[{"title":"A","exit":"a"}]}')) === "",
-);
-const manyUnknowns = plan.parsePlan(
-	JSON.stringify({ objective: "O", exit: "E", milestones: [{ title: "A", exit: "a" }], unknowns: ["u1", "u2", "u3", "u4", "u5"] }),
-);
-const manyQuestions = plan.questionsText(manyUnknowns);
-check(
-	"questions cap at 3 and summarize the rest",
-	manyQuestions.includes("1. u1") && manyQuestions.includes("3. u3") && !manyQuestions.includes("4. u4") && manyQuestions.includes("还有 2 条"),
-);
-
-console.log("[plan] readPlanFile");
-const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
-const os = await import("node:os");
-const path = await import("node:path");
-const dir = mkdtempSync(path.join(os.tmpdir(), "pi-goal-plan-"));
-writeFileSync(path.join(dir, "P.md"), "# the plan\n");
-check("reads a relative file against cwd", (await plan.readPlanFile("P.md", dir)).includes("the plan"));
-rmSync(dir, { recursive: true, force: true });
+rmSync(sandbox, { recursive: true, force: true });
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

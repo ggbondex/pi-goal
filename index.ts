@@ -17,8 +17,8 @@
  *
  * Commands:
  *   /goal <objective>      start a goal (or replace the current one)
- *   /goal plan <idea|@f>   plan an objective + ordered milestones first, then run
- *   /goal                  show status (the milestone board when there is a plan)
+ *   /goal plan <idea|@f>   plan first: research, write a plan file, then hand it to the loop
+ *   /goal                  show status
  *   /goal stop             stop the loop (keeps the objective for /goal resume)
  *   /goal resume           re-activate from the last verdict and keep going
  *   /goal clear            delete the goal entirely
@@ -26,11 +26,13 @@
  *   /goal max <n>          hard cap on automatic continuations (default 15)
  *   /goal help             usage
  *
- * Plan mode is opt-in: only `/goal plan` does it. It reads the referenced file
- * (read-only), asks a model to turn the intent into a frozen objective plus an
- * ordered list of milestones, prints the board, and waits. The user confirms
- * with an ordinary reply ("同意"); the extension classifies it — no second
- * `/goal plan` is needed. Plain `/goal` keeps the old verbatim behavior.
+ * Planning is a prologue, not a mode: `/goal plan` runs ONE research turn that
+ * writes a plan file (plus a one-sentence objective and the exit criterion in its
+ * header), optionally asks the user a question first if it cannot commit without
+ * one, and then waits for a plain reply ("同意"). Confirming starts an ordinary
+ * goal — same loop, same judge, no milestone bookkeeping anywhere: the plan is a
+ * route the agent reads and may update, never a ledger that defines completion.
+ * Plain `/goal` is unchanged.
  *
  * Environment defaults:
  *   PI_GOAL_MAX            default max continuations
@@ -57,32 +59,26 @@ import type {
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import {
-	boardText,
 	buildPlanningInstruction,
 	classifyReply,
-	currentMilestone,
 	ensurePlanDir,
 	findPlanFile,
-	isPlanComplete,
 	kickoff,
-	markDone,
-	milestoneRange,
-	parsePlannerReply,
 	planFilePath,
-	questionsText,
+	planPreview,
+	readPlanDraft,
 	readPlanFile,
 	requirementsText,
-	type Plan,
+	type PlanDraft,
 	type PlanSource,
-	type PlannerReply,
 } from "./plan.ts";
 
 const ENTRY_TYPE = "goal-loop";
 const MESSAGE_TYPE = "goal-loop-continuation";
 const STATUS_KEY = "goal-loop";
-/** What `message_end` shows instead of the planning turn's raw JSON. */
-const PLANNING_PLACEHOLDER = "（已生成计划，见下方看板）";
 const DEBUG = process.env.PI_GOAL_DEBUG === "1" || process.env.PI_GOAL_DEBUG === "true";
+/** How many clarify rounds we give a planner that never writes the file. */
+const MAX_PLAN_ROUNDS = 3;
 
 const DEFAULT_MAX_ITERATIONS = 15;
 const MAX_JUDGE_ERRORS = 3;
@@ -110,8 +106,8 @@ const STOP_LABELS: Record<string, string> = {
 
 const HELP_TEXT = [
 	"/goal <目标>         启动目标循环（会覆盖当前目标）",
-	"/goal plan <目标|@文件>  先生成目标 + 里程碑看板，确认后再跑",
-	"/goal                查看状态（有计划时显示里程碑看板）",
+	"/goal plan <目标|@文件>  先调研仓库写好一份计划，确认后交给循环跑",
+	"/goal                查看状态",
 	"/goal stop           停止循环（保留目标，可 resume）",
 	"/goal resume         从断点接着跑",
 	"/goal clear          彻底清除目标",
@@ -124,13 +120,18 @@ interface Verdict {
 	blocked: boolean;
 	reason: string;
 	next: string;
-	/** Last milestone the judge found verifiably done (plan mode); extends the tick range forward. */
-	doneThrough?: string;
 }
 
 interface GoalState {
 	active: boolean;
 	objective: string;
+	/**
+	 * The plan's exit criterion, when a plan produced one. Only ever read to
+	 * show it and to hand it to the judge — nothing counts anything off it.
+	 */
+	exit?: string;
+	/** The readable plan this goal works from (plan prologue only). */
+	planFile?: string;
 	iterations: number;
 	maxIterations: number;
 	/** "" means "use the session's active model". */
@@ -140,30 +141,17 @@ interface GoalState {
 	waitingForUser?: boolean;
 	/** Set on the tombstone entry that deletes the goal from the branch. */
 	cleared?: boolean;
-	/** Planning lifecycle: research, then await answers or confirmation. */
+	/** Prologue lifecycle: research the repo, then await answers or confirmation. */
 	phase?: "planning" | "awaiting-answers" | "awaiting-confirmation";
-	/** Frozen objective + milestones; only set in plan mode. */
-	plan?: Plan;
+	/**
+	 * The planner's own message when it asked instead of writing a plan. Kept so
+	 * the question can be shown again after a reload, and so the user can answer it.
+	 */
+	plannerMessage?: string;
 	/** The user's raw intent and plan file, kept for provenance and re-planning. */
 	source?: PlanSource;
-	/** The plugin-owned file holding this plan's detail. */
-	detailFile?: string;
-	/** Questions the planner asked before it could plan. */
-	questions?: string[];
 	/** Answers / change requests the user gave, fed back into re-planning. */
 	clarifications?: string[];
-	/** True once we have already asked the user about a plan's unknowns. */
-	askedUnknowns?: boolean;
-	/**
-	 * The planning turn's raw JSON, written by `message_end`.
-	 *
-	 * It has to live here as well as in memory: `message_end` replaces the message
-	 * text with a placeholder, so after that the transcript no longer holds the
-	 * JSON, and several paths clear the in-memory copy (the settle that consumes
-	 * it, a re-plan, a reload). With only the memory copy, any of those turned a
-	 * perfectly good plan into "planner returned no JSON object".
-	 */
-	pendingPlanRaw?: string;
 	lastVerdict?: Verdict;
 	createdAt: number;
 	updatedAt: number;
@@ -187,29 +175,9 @@ function asBool(value: unknown): boolean {
 	return value === true || value === "true" || value === 1;
 }
 
-export type PendingPlanSource = "memory" | "state" | "transcript" | "placeholder" | "empty";
-
-/**
- * Which copy of the planner's JSON the settle step should use.
- *
- * `message_end` swaps the planning turn's text for a placeholder, so the
- * transcript can hold the placeholder and nothing else. Falling back to that
- * text made the plugin report "planner returned no JSON object" for plans it had
- * parsed itself seconds earlier — the model was never at fault. So the
- * transcript is only used when it genuinely looks like planner output, and the
- * placeholder is reported as what it is: an internal copy loss.
- */
-export function pickPendingPlanRaw(
-	memoryRaw: string,
-	stateRaw: string | undefined,
-	transcriptRaw: string,
-): { raw: string; source: PendingPlanSource } {
-	if (memoryRaw.trim()) return { raw: memoryRaw, source: "memory" };
-	if ((stateRaw ?? "").trim()) return { raw: stateRaw ?? "", source: "state" };
-	const transcript = transcriptRaw.trim();
-	if (!transcript) return { raw: "", source: "empty" };
-	if (transcript === PLANNING_PLACEHOLDER) return { raw: "", source: "placeholder" };
-	return { raw: transcriptRaw, source: "transcript" };
+/** Trim a long text for a notification (the full text stays in the transcript). */
+function clip(text: string, max: number): string {
+	return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 function stateDraft(state: GoalState): SessionBoundaryDraft {
@@ -264,8 +232,7 @@ function lastErrorAttempt(event: AgentBeforeSettleEvent): { targetId?: string; m
 // prompts
 // ---------------------------------------------------------------------------
 
-function buildJudgePrompt(objective: string, transcript: string, plan?: Plan): string {
-	const current = plan ? currentMilestone(plan) : undefined;
+function buildJudgePrompt(objective: string, transcript: string, exit?: string): string {
 	const lines = [
 		"You are the completion judge inside an autonomous coding-agent loop.",
 		"",
@@ -274,86 +241,43 @@ function buildJudgePrompt(objective: string, transcript: string, plan?: Plan): s
 		objective,
 		"</goal>",
 	];
-	if (plan && current) {
-		lines.push(
-			"",
-			"You are judging how far this plan has actually advanced, starting at the CURRENT milestone.",
-			`CURRENT MILESTONE: ${current.id} ${current.title}`,
-			`ITS EXIT (done when): ${current.exit}`,
-			"",
-			"Decide which milestones, starting at the current one, are DONE — using ONLY evidence in the transcript.",
-			"",
-			"Rules:",
-			"- Require concrete evidence in the transcript: files created or edited, commands run and their results, tests passing. A claim alone is not evidence.",
-			"- Each milestone needs ITS OWN exit criterion satisfied. Evidence that matches a different milestone never counts for this one.",
-			"- answer done_through = the LAST milestone the evidence supports, counting from the current one, with every milestone in between ALSO supported. If the current milestone itself is not done: done=false and an empty done_through.",
-			"- Later milestones are NOT required: stopping at the current one is a normal, correct answer. Never guess a later milestone forward.",
-			"- The agent asking \"shall I continue?\" / writing a summary and pausing is NOT done: answer done=false and name the next concrete step.",
-			"- Out of context / a length limit / asking for a fresh session is NOT a blocker; the harness compacts and continues. Answer done=false and name the next concrete step.",
-			"- Set blocked=true only when the agent genuinely cannot proceed without new information, credentials, or a decision only the user can supply.",
-			"- next must be a single concrete step: toward the current milestone when not done, otherwise the step that follows done_through.",
-			"",
-			"ALL MILESTONES (context only; [>] is where you start judging):",
-			...plan.milestones.map(
-				(m) => `- [${m.status === "done" ? "x" : m.id === current.id ? ">" : " "}] ${m.id} ${m.title} — ${m.exit}`,
-			),
-			"",
-			"Reply with ONE JSON object and nothing else (no markdown fences, no prose):",
-			'{"done": <boolean: is the CURRENT MILESTONE done?>, "done_through": "<milestone id: the last one the evidence supports, \"\" if none>", "blocked": <boolean>, "reason": "<one or two sentences>", "next": "<single concrete next action>"}',
-		);
-	} else {
-		lines.push(
-			"",
-			"Decide whether the GOAL is FULLY achieved, using ONLY evidence in the transcript.",
-			"",
-			"Rules:",
-			"- Judge against the goal's own success criteria, not against \"the agent did something\".",
-			"- Require concrete evidence in the transcript: files created or edited, commands run and their results, tests passing, artifacts produced.",
-			"- The agent asking the user \"shall I continue?\" / writing a summary and pausing is NOT completion and NOT a blocker: answer done=false and name the next concrete step.",
-			"- The agent claiming it ran out of context or hit a length limit is NOT a blocker: the harness compacts and continues. Answer done=false and name the next concrete step.",
-			"- Set blocked=true only when the agent genuinely cannot proceed without new information, credentials, or a decision only the user can supply.",
-			"- If done=true then next must be an empty string.",
-			"- Do not invent requirements the goal does not state. Be strict but fair.",
-			"",
-			"Reply with ONE JSON object and nothing else (no markdown fences, no prose):",
-			'{"done": <boolean>, "blocked": <boolean>, "reason": "<one or two sentences>", "next": "<single concrete next action, or empty string>"}',
-		);
+	if (exit) {
+		lines.push("", "THE EXIT CRITERION the goal was planned against:", "<exit>", exit, "</exit>");
 	}
+	lines.push(
+		"",
+		"Decide whether the GOAL is FULLY achieved, using ONLY evidence in the transcript.",
+		"",
+		"Rules:",
+		'- Judge against the goal\'s own success criteria, not against "the agent did something".',
+		"- Require concrete evidence in the transcript: files created or edited, commands run and their results, tests passing, artifacts produced.",
+		'- The agent asking the user "shall I continue?" / writing a summary and pausing is NOT completion and NOT a blocker: answer done=false and name the next concrete step.',
+		"- The agent claiming it ran out of context or hit a length limit is NOT a blocker: the harness compacts and continues. Answer done=false and name the next concrete step.",
+		"- Set blocked=true only when the agent genuinely cannot proceed without new information, credentials, or a decision only the user can supply.",
+		"- If done=true then next must be an empty string.",
+		"- Do not invent requirements the goal does not state. Be strict but fair.",
+		"",
+		"Reply with ONE JSON object and nothing else (no markdown fences, no prose):",
+		'{"done": <boolean>, "blocked": <boolean>, "reason": "<one or two sentences>", "next": "<single concrete next action, or empty string>"}',
+	);
 	lines.push("", "TRANSCRIPT (oldest to newest; it may be truncated at the front):", "<transcript>", transcript, "</transcript>");
 	return lines.join("\n");
 }
 
-function buildContinuation(objective: string, verdict: Verdict, iteration: number, max: number, plan?: Plan): string {
-	const step = verdict.next.trim() || "继续推进当前里程碑，直到它完成并自行验证。";
-	const credited = plan ? plan.milestones.filter((m) => m.status === "done").length : 0;
-	const head = plan
-		? verdict.done
-			? `上一轮的里程碑已完成（已认到 ${credited}/${plan.milestones.length} 片），已自动进入下一片。`
-			: "当前里程碑尚未完成，已自动接续，无需等待用户确认。"
-		: "上一轮结束时目标尚未完成，现已自动接续，无需等待用户确认。";
+function buildContinuation(objective: string, verdict: Verdict, iteration: number, max: number, planFile?: string): string {
+	const step = verdict.next.trim() || "继续推进目标，完成每步后自行验证。";
 	const lines = [
 		`[goal-loop 自动续跑 ${iteration}/${max}]`,
-		head,
+		"上一轮结束时目标尚未完成，现已自动接续，无需等待用户确认。",
 		"",
 		`判定原因：${verdict.reason || "(未给出)"}`,
 		`下一步：${step}`,
 		"",
-		"--- 原始目标 ---",
+		"--- 目标 ---",
 		objective,
 	];
-	if (plan) {
-		const current = currentMilestone(plan);
-		lines.push(
-			"",
-			"--- 里程碑路线（▶ 当前）---",
-			...plan.milestones.map((m) => `${m.status === "done" ? "✅" : m === current ? "▶" : "·"} ${m.id} ${m.title} — ${m.exit}`),
-		);
-		if (plan.detailFile) lines.push(`详细计划：${plan.detailFile}`);
-	}
-	lines.push(
-		"",
-		requirementsText(),
-	);
+	if (planFile) lines.push(`计划：${planFile}（路线图，可以随认知更新它）`);
+	lines.push("", requirementsText());
 	return lines.join("\n");
 }
 
@@ -367,8 +291,6 @@ export default function goalLoop(pi: ExtensionAPI): void {
 	let judgeErrors = 0;
 	/** Transient-error cooldowns spent on the current goal. */
 	let settleRetries = 0;
-	/** The planning turn's raw JSON, kept out of the transcript but available at settle. */
-	let planningOutput = "";
 
 	let defaultMaxIterations = parsePositiveInt(process.env.PI_GOAL_MAX) ?? DEFAULT_MAX_ITERATIONS;
 	let defaultJudgeModel = process.env.PI_GOAL_MODEL ?? "";
@@ -391,10 +313,12 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		try {
 			if (state?.phase === "planning") {
 				ctx.ui.setStatus(STATUS_KEY, "🎯 规划中…");
+			} else if (state?.phase === "awaiting-confirmation") {
+				ctx.ui.setStatus(STATUS_KEY, "🎯 计划待确认 · 回「同意」开跑");
+			} else if (state?.phase === "awaiting-answers") {
+				ctx.ui.setStatus(STATUS_KEY, "🎯 规划等你回答");
 			} else if (state?.active) {
-				const label = state.plan
-					? `🎯 ${state.plan.milestones.filter((m) => m.status === "done").length}/${state.plan.milestones.length} · ${state.iterations}/${state.maxIterations}轮 ${state.plan.objective.slice(0, 16)}`
-					: `🎯 goal ${state.iterations}/${state.maxIterations}`;
+				const label = `🎯 ${state.planFile ? "plan" : "goal"} ${state.iterations}/${state.maxIterations} · ${state.objective.slice(0, 20)}`;
 				ctx.ui.setStatus(STATUS_KEY, label);
 			} else if (state?.waitingForUser && state.stopReason) {
 				ctx.ui.setStatus(STATUS_KEY, `🎯 ${STOP_LABELS[state.stopReason] ?? state.stopReason} · 等你答复`);
@@ -410,12 +334,25 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		if (state) pi.appendEntry(ENTRY_TYPE, state);
 	}
 
-	/** Show a plan: the board, then the undecided points as their own warning block. */
-	function showPlan(ctx: ExtensionContext, plan: Plan, header?: string): void {
-		const run = state ? { iterations: state.iterations, maxIterations: state.maxIterations } : undefined;
-		notify(ctx, `${header ? `${header}\n\n` : ""}${boardText(plan, run)}`, "info");
-		const questions = questionsText(plan);
-		if (questions) notify(ctx, questions, "warning");
+	/** The draft, as the user sees it: what it is, where it lives, and how to start. */
+	function showDraft(ctx: ExtensionContext, draft: PlanDraft, file: string | undefined, body: string): void {
+		const preview = planPreview(body);
+		const lines = [
+			"🎯 计划已写好（回复「同意」就开始跑，说要改什么我就重新规划）",
+			"",
+			`目标：${draft.objective}`,
+			...(draft.exit ? [`出口：${draft.exit}`] : []),
+			...(file ? [`详细计划：${file}`] : []),
+			"",
+			preview.text,
+			...(preview.more ? ["…（还有更多，全文在那个文件里）"] : []),
+		];
+		notify(ctx, lines.join("\n"), "info");
+	}
+
+	/** The planner's own words when it asked instead of planning; shown again after a reload. */
+	function showPlannerMessage(ctx: ExtensionContext, text: string): void {
+		notify(ctx, `❓ 规划还没定下来 —— 它需要你先回答：\n\n${clip(text, 1500)}\n\n回一句就行，我会带着你的回答重新规划。`, "warning");
 	}
 
 	function reconstruct(ctx: ExtensionContext): void {
@@ -438,12 +375,14 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			state = null;
 			pi.appendEntry(ENTRY_TYPE, { cleared: true, updatedAt: Date.now() });
 			notify(ctx, "🎯 上次规划被中断，请重新 /goal plan。", "warning");
-		} else if (state?.phase === "awaiting-answers" && state.plan) {
-			showPlan(ctx, state.plan, "🎯 有一份计划，先回答下面几点：");
-		} else if (state?.phase === "awaiting-answers" && state.questions?.length) {
-			notify(ctx, `❓ 规划需要你先回答：\n${state.questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}`, "warning");
-		} else if (state?.phase === "awaiting-confirmation" && state.plan) {
-			showPlan(ctx, state.plan, "🎯 有一份待确认的计划（回复「同意」开始）：");
+		} else if (state?.phase === "awaiting-answers" && state.plannerMessage) {
+			showPlannerMessage(ctx, state.plannerMessage);
+		} else if (state?.phase === "awaiting-confirmation") {
+			notify(
+				ctx,
+				`🎯 有一份待确认的计划（回复「同意」开始）：\n\n目标：${state.objective}\n${state.exit ? `出口：${state.exit}\n` : ""}${state.planFile ? `详细计划：${state.planFile}` : ""}`,
+				"info",
+			);
 		} else if (state?.active) {
 			notify(
 				ctx,
@@ -511,8 +450,8 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			.join("\n");
 	}
 
-	async function judge(ctx: ExtensionContext, objective: string, transcript: string, plan?: Plan): Promise<Verdict> {
-		return parseVerdict(await completeText(ctx, buildJudgePrompt(objective, transcript, plan)));
+	async function judge(ctx: ExtensionContext, objective: string, transcript: string, exit?: string): Promise<Verdict> {
+		return parseVerdict(await completeText(ctx, buildJudgePrompt(objective, transcript, exit)));
 	}
 
 	function parseVerdict(raw: string): Verdict {
@@ -538,11 +477,8 @@ export default function goalLoop(pi: ExtensionAPI): void {
 					asString(obj.nextStep) ||
 					asString(obj.next_action) ||
 					"";
-				const doneThrough =
-					asString(obj.done_through) || asString(obj.doneThrough) || asString(obj.through) || "";
 				return {
 					done,
-					doneThrough: done ? doneThrough : "",
 					blocked: done ? false : blocked,
 					reason: reason || (done ? "judge: done" : "judge: not done"),
 					next: done ? "" : next,
@@ -562,7 +498,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 
 	function stopWith(reason: GoalState["stopReason"], objectiveReason: string, ctx: ExtensionContext, kind: NotifyKind): void {
 		if (!state) return;
-		state = { ...state, active: false, phase: undefined, questions: undefined, stopReason: reason, waitingForUser: false, updatedAt: Date.now() };
+		state = { ...state, active: false, phase: undefined, plannerMessage: undefined, stopReason: reason, waitingForUser: false, updatedAt: Date.now() };
 		updateStatus(ctx);
 		notify(ctx, objectiveReason, kind);
 	}
@@ -620,62 +556,46 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		if (event.outcome === "aborted") return cancel("🎯 规划已取消。", "warning");
 		if (event.outcome === "error") return cancel("🎯 规划以错误结束，已取消。", "error");
 
-		// Never read the transcript blindly: `message_end` put a placeholder there,
-		// so the only correct sources are the in-memory stash and the persisted
-		// copy, in that order.
-		const picked = pickPendingPlanRaw(planningOutput, s.pendingPlanRaw, lastAssistantText(event));
-		let reply: PlannerReply;
-		try {
-			reply = parsePlannerReply(picked.raw);
-		} catch (err) {
-			if (picked.source === "placeholder") {
-				return cancel("🎯 规划失败：这一轮的 JSON 丢了（插件内部状态，不是模型没给）—— 请重跑 /goal plan。", "error");
+		// The judgement is the FILE: the plan is a document, so "is there a plan?" is a
+		// question about the workbench, not about parsing a reply. No file means
+		// the planner asked something instead (the prompt says it must not write
+		// both), so its own words become the question we show.
+		const draft = s.planFile ? await readPlanDraft(s.planFile, ctx.cwd) : null;
+		if (!draft) {
+			const text = lastAssistantText(event).trim();
+			const rounds = (s.clarifications?.length ?? 0) + 1;
+			if (!text) {
+				return cancel(`🎯 规划没写成：既没有计划文件（${s.planFile ?? "?"}），这一轮也没有任何内容。`, "error");
 			}
-			if (picked.source === "empty") {
-				return cancel("🎯 规划失败：规划回合没有给出任何内容。", "error");
+			if (rounds >= MAX_PLAN_ROUNDS) {
+				return cancel(`🎯 规划连着 ${rounds} 轮没写出计划文件，先停下（下面是它最后说的话）：\n\n${clip(text, 800)}`, "error");
 			}
-			return cancel(`🎯 规划失败，未启动：${err instanceof Error ? err.message : String(err)}`, "error");
-		}
-		// Consumed. Drop the copies only now, so a failed parse above leaves them
-		// available for a retry instead of throwing the plan away.
-		planningOutput = "";
-		if (s.pendingPlanRaw) {
-			s = { ...s, pendingPlanRaw: undefined };
-			state = s;
-		}
-		if (DEBUG) console.error(`[goal] planning JSON settled from ${picked.source}`);
-
-		if (reply.kind === "questions") {
-			state = { ...s, phase: "awaiting-answers", questions: reply.questions, updatedAt: Date.now() };
+			if (DEBUG) console.error(`[goal] planner asked instead of writing ${s.planFile} (round ${rounds})`);
+			state = { ...s, phase: "awaiting-answers", plannerMessage: text, updatedAt: Date.now() };
 			updateStatus(ctx);
-			notify(ctx, `🎯 规划需要你先回答：\n${reply.questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}`, "info");
+			showPlannerMessage(ctx, text);
 			entries.push(stateDraft(state));
 			return { entries };
 		}
 
-		// A plan with points the planner could not verify: ask the user about them once
-		// (folded back in as clarifications), then re-plan. Bounded to one round.
-		const plan: Plan = { ...reply.plan, detailFile: s.detailFile };
-		const unknowns = plan.unknowns ?? [];
-		if (unknowns.length && !s.askedUnknowns) {
-			state = {
-				...s,
-				objective: plan.objective,
-				plan,
-				phase: "awaiting-answers",
-				questions: unknowns,
-				askedUnknowns: true,
-				updatedAt: Date.now(),
-			};
-			updateStatus(ctx);
-			showPlan(ctx, plan, "🎯 计划草案（回复「同意」开始，或先回答下面这几点）：");
-			entries.push(stateDraft(state));
-			return { entries };
-		}
-
-		state = { ...s, objective: plan.objective, plan, phase: "awaiting-confirmation", questions: undefined, updatedAt: Date.now() };
+		state = {
+			...s,
+			objective: draft.objective,
+			exit: draft.exit,
+			phase: "awaiting-confirmation",
+			plannerMessage: undefined,
+			updatedAt: Date.now(),
+		};
 		updateStatus(ctx);
-		showPlan(ctx, plan, "🎯 计划草案（回复「同意」开始，或直接说要改什么）：");
+		let body = "";
+		if (s.planFile) {
+			try {
+				body = await readPlanFile(s.planFile, ctx.cwd);
+			} catch {
+				// The header parsed a moment ago; an unreadable body just means no preview.
+			}
+		}
+		showDraft(ctx, draft, s.planFile, body);
 		entries.push(stateDraft(state));
 		return { entries };
 	}
@@ -717,36 +637,6 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		};
 	});
 
-	// Keep the planning turn's raw JSON out of the transcript: stash it for the
-	// settle step and show a one-line placeholder instead.
-	pi.on("message_end", async (event) => {
-		if (state?.phase !== "planning") return;
-		const message = event.message as { role?: string; content?: unknown };
-		if (message.role !== "assistant") return;
-		const text = messageText(message);
-		if (!text.trim()) return;
-		try {
-			parsePlannerReply(text);
-		} catch {
-			return;
-		}
-		planningOutput = text;
-		// Durable copy. The line below erases the JSON from the transcript, so the
-		// in-memory variable becomes the only other place it exists — and that one
-		// gets cleared by the settle that consumes it, by a re-plan, and by a
-		// reload. Persist it with the state so a lost copy is recoverable.
-		if (state) {
-			state = { ...state, pendingPlanRaw: text };
-			persist();
-		}
-		return {
-			message: {
-				...(event.message as object),
-				content: [{ type: "text", text: PLANNING_PLACEHOLDER }],
-			} as typeof event.message,
-		};
-	});
-
 	// A /goal plan draft waits for the user's confirmation. The reply is an
 	// ordinary message, so no second `/goal plan` is needed: classify it here and
 	// either start the run, discard the draft, or re-plan with the feedback.
@@ -757,14 +647,14 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		// The planner asked questions: the reply is an answer, then plan again.
 		if (s.phase === "awaiting-answers" && s.source) {
 			const clarifications = [...(s.clarifications ?? []), event.text.trim()];
-			state = { ...s, phase: "planning", questions: undefined, clarifications, updatedAt: Date.now() };
+			state = { ...s, phase: "planning", plannerMessage: undefined, clarifications, updatedAt: Date.now() };
 			persist();
 			notify(ctx, "🎯 收到，接着规划…", "info");
-			await beginPlanning(ctx, s.source.intent, s.source.file, clarifications, s.detailFile);
+			await beginPlanning(ctx, s.source.intent, s.source.file, clarifications, s.planFile);
 			return { action: "handled" };
 		}
 
-		if (s.phase !== "awaiting-confirmation" || !s.plan || !s.source) return;
+		if (s.phase !== "awaiting-confirmation" || !s.source) return;
 
 		const kind = classifyReply(event.text);
 
@@ -784,17 +674,17 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			state = { ...s, phase: "planning", clarifications, updatedAt: Date.now() };
 			persist();
 			notify(ctx, "🎯 按你的意见重新规划中…", "info");
-			await beginPlanning(ctx, s.source.intent, s.source.file, clarifications, s.detailFile);
+			await beginPlanning(ctx, s.source.intent, s.source.file, clarifications, s.planFile);
 			return { action: "handled" };
 		}
 
-		state = { ...s, active: true, phase: undefined, clarifications: undefined, updatedAt: Date.now() };
+		state = { ...s, active: true, phase: undefined, clarifications: undefined, plannerMessage: undefined, updatedAt: Date.now() };
 		judgeErrors = 0;
 		settleRetries = 0;
 		persist();
 		updateStatus(ctx);
 		notify(ctx, `🎯 计划已确认，开始执行（上限 ${s.maxIterations} 次续跑）。`, "info");
-		return { action: "transform", text: kickoff(s.plan) };
+		return { action: "transform", text: kickoff(s.objective, s.exit ?? "", s.planFile) };
 	});
 
 	// The whole loop lives here: this is the last boundary before pi settles.
@@ -880,7 +770,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			}
 		}
 		try {
-			verdict = await judge(ctx, s.objective, buildTranscript(event), s.plan);
+			verdict = await judge(ctx, s.objective, buildTranscript(event), s.exit);
 			judgeErrors = 0;
 			settleRetries = 0;
 		} catch (err) {
@@ -928,20 +818,10 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			return { entries };
 		}
 
-		// In plan mode the judge answers a narrow question: from the current milestone,
-		// how far does the evidence go? Tick that whole stretch in one round, not one
-		// plate per round — the agent routinely finishes several plates in a single
-		// turn, and crediting them one at a time is what made the loop look laggy.
-		// The goal is done only when every milestone is ticked — so the plan, not the
-		// model, defines completeness.
-		let plan = s.plan;
-		if (plan && verdict.done) {
-			plan = markDone(plan, milestoneRange(plan, verdict.doneThrough), verdict.reason);
-		}
-		const goalDone = verdict.done && (!plan || isPlanComplete(plan));
-
-		if (goalDone) {
-			state = { ...s, plan, active: false, stopReason: "done", waitingForUser: false, lastVerdict: verdict, updatedAt: Date.now() };
+		// The judge answers one question: is the goal achieved? A plan is a route, never
+		// a ledger, so nothing is ticked off here and the plan cannot veto completion.
+		if (verdict.done) {
+			state = { ...s, active: false, stopReason: "done", waitingForUser: false, lastVerdict: verdict, updatedAt: Date.now() };
 			updateStatus(ctx);
 			notify(ctx, `🎯 目标已完成：${verdict.reason}`, "info");
 			entries.push(stateDraft(state));
@@ -949,7 +829,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		}
 
 		if (verdict.blocked) {
-			state = { ...s, plan, active: false, stopReason: "blocked", waitingForUser: true, lastVerdict: verdict, updatedAt: Date.now() };
+			state = { ...s, active: false, stopReason: "blocked", waitingForUser: true, lastVerdict: verdict, updatedAt: Date.now() };
 			updateStatus(ctx);
 			notify(ctx, `🎯 目标受阻，需要你决定后才能继续：${verdict.reason}\n回答后循环会自动恢复；想彻底停下用 /goal stop。`, "warning");
 			entries.push(stateDraft(state));
@@ -957,14 +837,14 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		}
 
 		const iteration = s.iterations + 1;
-		state = { ...s, plan, iterations: iteration, lastVerdict: verdict, updatedAt: Date.now() };
+		state = { ...s, iterations: iteration, lastVerdict: verdict, updatedAt: Date.now() };
 		updateStatus(ctx);
 
 		entries.push(stateDraft(state));
 		entries.push({
 			type: "custom_message",
 			customType: MESSAGE_TYPE,
-			content: buildContinuation(s.objective, verdict, iteration, s.maxIterations, plan),
+			content: buildContinuation(s.objective, verdict, iteration, s.maxIterations, s.planFile),
 			display: true,
 		});
 
@@ -981,7 +861,7 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		intent: string,
 		file: string | undefined,
 		clarifications: string[],
-		detailFile: string | undefined,
+		planFile: string | undefined,
 	): Promise<void> {
 		let fileText: string | undefined;
 		if (file) {
@@ -992,21 +872,14 @@ export default function goalLoop(pi: ExtensionAPI): void {
 				return;
 			}
 		}
-		if (detailFile) {
+		if (planFile) {
 			try {
-				await ensurePlanDir(detailFile, ctx.cwd);
+				await ensurePlanDir(planFile, ctx.cwd);
 			} catch {
 				// the planning turn will surface a write failure with more context
 			}
 		}
-		planningOutput = "";
-		if (state?.pendingPlanRaw) {
-			// A fresh planning turn makes the previous turn's copy stale.
-			if (DEBUG) console.error("[goal] dropping the previous planning JSON (new planning turn)");
-			state = { ...state, pendingPlanRaw: undefined };
-			persist();
-		}
-		pi.sendUserMessage(buildPlanningInstruction(intent, fileText, clarifications, detailFile));
+		pi.sendUserMessage(buildPlanningInstruction(intent, fileText, clarifications, planFile));
 	}
 
 	async function startPlan(intent: string, ctx: ExtensionContext): Promise<void> {
@@ -1019,13 +892,13 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			return;
 		}
 		const file = findPlanFile(intent);
-		const detailFile = planFilePath(intent);
+		const planFile = planFilePath(intent);
 		state = {
 			active: false,
 			phase: "planning",
 			objective: intent,
 			source: { intent, file },
-			detailFile,
+			planFile,
 			clarifications: [],
 			iterations: 0,
 			maxIterations: defaultMaxIterations,
@@ -1037,8 +910,8 @@ export default function goalLoop(pi: ExtensionAPI): void {
 		settleRetries = 0;
 		persist();
 		updateStatus(ctx);
-		notify(ctx, `🎯 规划中：正在调研仓库，详细计划写到 ${detailFile}；稍后给你看里程碑看板…`, "info");
-		await beginPlanning(ctx, intent, file, [], detailFile);
+		notify(ctx, `🎯 规划中：正在调研仓库，把计划写到 ${planFile}；写好给你过一眼…`, "info");
+		await beginPlanning(ctx, intent, file, [], planFile);
 	}
 
 	function startGoal(objective: string, ctx: ExtensionCommandContext): void {
@@ -1074,29 +947,20 @@ export default function goalLoop(pi: ExtensionAPI): void {
 			notify(ctx, "当前没有目标。用法：/goal <目标>", "info");
 			return;
 		}
-		if (s.plan) {
-			const status =
-				s.phase === "awaiting-confirmation"
-					? "待确认（回复「同意」开始）"
+		const status = s.phase === "awaiting-confirmation"
+			? "待确认（回复「同意」就开始跑）"
+			: s.phase === "awaiting-answers"
+				? "规划等你回答"
+				: s.phase === "planning"
+					? "规划中"
 					: s.active
 						? "进行中"
 						: `已停止（${s.stopReason ? (STOP_LABELS[s.stopReason] ?? s.stopReason) : "unknown"}）`;
-			const verdict = s.lastVerdict;
-			const verdictLine = verdict
-				? `\n上次判定：${verdict.done ? "当前片完成" : verdict.blocked ? "受阻" : "当前片未完成"} — ${verdict.reason}`
-				: "";
-			notify(
-				ctx,
-				`${boardText(s.plan, { iterations: s.iterations, maxIterations: s.maxIterations })}\n\n状态：${status}${verdictLine}\n判定模型：${s.judgeModel || "跟随当前会话模型"}`,
-				"info",
-			);
-			const questions = questionsText(s.plan);
-			if (questions) notify(ctx, questions, "warning");
-			return;
-		}
 		const lines = [
 			`目标：${s.objective}`,
-			`状态：${s.active ? "进行中" : `已停止（${s.stopReason ? (STOP_LABELS[s.stopReason] ?? s.stopReason) : "unknown"}）`}`,
+			...(s.exit ? [`出口：${s.exit}`] : []),
+			...(s.planFile ? [`计划：${s.planFile}`] : []),
+			`状态：${status}`,
 			`续跑：${s.iterations}/${s.maxIterations}`,
 			`判定模型：${s.judgeModel || "跟随当前会话模型"}`,
 		];
@@ -1239,10 +1103,8 @@ export default function goalLoop(pi: ExtensionAPI): void {
 					: s.active
 						? theme.fg("accent", "active")
 						: theme.fg("dim", s.stopReason ? (STOP_LABELS[s.stopReason] ?? s.stopReason) : "stopped");
-		const progress = s.plan
-			? `${s.plan.milestones.filter((m) => m.status === "done").length}/${s.plan.milestones.length} · ${s.iterations}/${s.maxIterations}轮`
-			: `${s.iterations}/${s.maxIterations}`;
-		const head = theme.fg("muted", `🎯 ${s.plan ? "plan" : "goal"} ${progress} `) + status;
+		const progress = `${s.iterations}/${s.maxIterations}轮`;
+		const head = theme.fg("muted", `🎯 ${s.planFile ? "plan" : "goal"} ${progress} `) + status;
 		const objective = s.objective.length > 100 ? `${s.objective.slice(0, 100)}…` : s.objective;
 		return new Text(`${head}\n${theme.fg("dim", objective)}`, 0, 0);
 	});
